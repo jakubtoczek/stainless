@@ -1,0 +1,28 @@
+[project]
+name = "stainless"
+dynamic = ["version"]
+description = "Stainless — stained area in brightfield whole-slide scans (Zeiss CZI): DAB immunohistochemistry, SA-β-gal"
+# pylibCZIrw publishes no wheel past cp313; the launcher pins 3.13.
+requires-python = ">=3.12,<3.14"
+dependencies = [
+    "PySide6-Essentials>=6.6",
+    "numpy>=1.26",
+    "opencv-python-headless>=4.8",   # resize, polygons, morphology (headless: no Qt of its own)
+    "pylibCZIrw>=6.0,<7",            # tiled reads of CZI mosaics, pyramid levels
+    "czifile>=2026.3",               # the slide label image (pylibCZIrw has no attachment API)
+    "matplotlib>=3.8",               # the results plot
+    "openpyxl>=3.1",                 # results .xlsx
+]
+
+[project.scripts]
+stainless = "stainless.__main__:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/stainless"]
+
+[tool.hatch.version]
+path = "src/stainless/__init__.py"
