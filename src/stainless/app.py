@@ -1,5 +1,5 @@
 """The window. Widgets only: the measurement is analysis.py's, the experiment model.py's,
-the slide view viewer.py's, the figure plot.py's.
+the slide view viewer.py's, the figure plot.py's, the options options.py's.
 
 Tabs, in the order of the work: Sections (the slides, their regions, the settings,
 Measure) → Results → Experiment (the record of what was done). Drop anything anywhere:
@@ -11,6 +11,7 @@ from __future__ import annotations
 import copy
 import datetime
 import json
+import queue
 import sys
 import threading
 import time
@@ -21,38 +22,34 @@ from pathlib import Path
 import numpy as np
 from PySide6.QtCore import QEvent, QLocale, QObject, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import (QAction, QColor, QIcon, QKeySequence, QPainter, QPixmap,
-                           QShortcut)
+                           QShortcut, QTransform)
 from PySide6.QtWidgets import (QAbstractItemView, QAbstractScrollArea, QAbstractSpinBox,
                                QApplication, QCheckBox, QComboBox, QDoubleSpinBox,
                                QFileDialog, QFormLayout, QFrame, QHBoxLayout, QHeaderView,
                                QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow,
                                QMessageBox, QPlainTextEdit, QProgressBar, QPushButton,
                                QScrollArea, QSizePolicy, QSlider, QSplitter, QTableWidget,
-                               QTableWidgetItem, QTabWidget, QVBoxLayout, QWidget)
+                               QTableWidgetItem, QTabWidget, QTreeWidget, QTreeWidgetItem,
+                               QVBoxLayout, QWidget)
 
-from . import __version__, analysis, czi, model
-from .viewer import SlideView, level_for, region_colour, to_qimage
+from . import __version__, analysis, czi, model, options
+from .options import ColorButton
+from .viewer import (REGION_COLOURS, SlideView, default_colour, display, level_for,
+                     to_qimage, wb_lut)
 
 APP_NAME = "Stainless"
 _PKG = Path(__file__).resolve().parent
-OPTIONS = _PKG.parents[1] / "stainless_options.json"       # beside Stainless.bat
-DEFAULT_OPTIONS = {"last_dir": "", "region_names": model.REGION_NAMES}
+OPTIONS = options.FILE                                     # beside Stainless.bat
 HINT = "Drop CZI scans or folders anywhere on this window, or a saved experiment (.json)."
 RESOLUTIONS = ["scan", "½", "¼"]       # Settings.level 0, 1, 2
 THUMB = 72
+CHECKED = ("QPushButton{padding:4px 8px; border:1px solid #4a4a4a; border-radius:4px;}"
+           "QPushButton:checked{background:#2f6ea5; color:#fff; border:1px solid #4aa3ff;}")
 
 
 def app_icon():
     p = _PKG / "assets" / "stainless.ico"
     return QIcon(str(p)) if p.exists() else None
-
-
-def load_options() -> dict:
-    try:
-        d = json.loads(OPTIONS.read_text(encoding="utf-8"))
-        return {**copy.deepcopy(DEFAULT_OPTIONS), **(d if isinstance(d, dict) else {})}
-    except (OSError, ValueError):
-        return copy.deepcopy(DEFAULT_OPTIONS)
 
 
 # --- small widgets (the suite's look) ----------------------------------------------------
@@ -89,43 +86,104 @@ def dim(text: str) -> QLabel:
     return lab
 
 
-def section(title: str, on_reset=None):
-    """A titled, bordered block of the side panel; returns (frame, body layout)."""
-    frame = QFrame(objectName="sec")
-    frame.setStyleSheet("QFrame#sec{border:1px solid #3a3a3a; border-radius:6px;}")
-    col = QVBoxLayout(frame)
-    col.setContentsMargins(8, 6, 8, 8)
-    col.setSpacing(5)
-    head = QHBoxLayout()
-    lab = QLabel(title.upper())
-    lab.setStyleSheet("color:#8b98a5; font-weight:600; font-size:10px; border:none;")
-    head.addWidget(lab)
-    head.addStretch(1)
-    if on_reset is not None:
-        b = QPushButton("Reset", flat=True)
-        b.setFixedHeight(18)
-        b.setStyleSheet("color:#7fa8d0; border:none; font-size:11px;")
-        b.clicked.connect(on_reset)
-        head.addWidget(b)
-    col.addLayout(head)
-    return frame, col
+class Block(QFrame):
+    """A titled, bordered block of the side panel; its title folds it."""
+
+    def __init__(self, title: str, collapsed=False, on_reset=None):
+        super().__init__(objectName="sec")
+        self.setStyleSheet("QFrame#sec{border:1px solid #3a3a3a; border-radius:6px;}")
+        col = QVBoxLayout(self)
+        col.setContentsMargins(8, 4, 8, 6)
+        col.setSpacing(5)
+        head = QHBoxLayout()
+        self.title = title
+        self.head = QPushButton(flat=True, cursor=Qt.PointingHandCursor,
+                                toolTip="fold or unfold")
+        self.head.setStyleSheet("QPushButton{color:#8b98a5; font-weight:600; font-size:10px; "
+                                "border:none; text-align:left; padding:2px 0;}")
+        self.head.clicked.connect(lambda: self.fold(self.body.isVisible()))
+        head.addWidget(self.head, 1)
+        if on_reset is not None:
+            b = QPushButton("Reset", flat=True, clicked=on_reset)
+            b.setFixedHeight(18)
+            b.setStyleSheet("color:#7fa8d0; border:none; font-size:11px;")
+            head.addWidget(b)
+            self.reset = b
+        col.addLayout(head)
+        self.body = QWidget()
+        self.v = QVBoxLayout(self.body)
+        self.v.setContentsMargins(0, 0, 0, 0)
+        self.v.setSpacing(5)
+        col.addWidget(self.body)
+        self.fold(collapsed)
+
+    def fold(self, on: bool):
+        self.body.setVisible(not on)
+        self.head.setText(("▸  " if on else "▾  ") + self.title.upper())
 
 
-def segmented(options, on_change):
+class Grip(QWidget):
+    """A handle under a list: drag it to make the list taller or shorter."""
+
+    def __init__(self, target: QWidget, on_done):
+        super().__init__()
+        self.target, self.on_done = target, on_done
+        self.setFixedHeight(9)
+        self.setCursor(Qt.SizeVerCursor)
+        self.setToolTip("drag to resize")
+        self._y = None
+
+    def paintEvent(self, e):
+        p = QPainter(self)
+        p.setPen(QColor("#6a6a6a"))
+        c = self.width() // 2
+        for y in (3, 6):
+            p.drawLine(c - 14, y, c + 14, y)
+
+    def mousePressEvent(self, e):
+        self._y, self._h = e.globalPosition().y(), self.target.height()
+
+    def mouseMoveEvent(self, e):
+        if self._y is not None:
+            self.target.setFixedHeight(max(40, int(self._h + e.globalPosition().y() - self._y)))
+
+    def mouseReleaseEvent(self, e):
+        self._y = None
+        self.on_done(self.target.height())
+
+
+def segmented(options_, on_change):
     row = QWidget()
-    row.setStyleSheet(
-        "QPushButton{padding:5px; border:1px solid #4a4a4a; border-radius:4px;}"
-        "QPushButton:checked{background:#2f6ea5; color:#fff; border:1px solid #4aa3ff;}")
+    row.setStyleSheet(CHECKED.replace("4px 8px", "5px"))
     h = QHBoxLayout(row)
     h.setContentsMargins(0, 0, 0, 0)
     h.setSpacing(4)
     btns = []
-    for i, text in enumerate(options):
+    for i, text in enumerate(options_):
         b = QPushButton(text, checkable=True, autoExclusive=True)
         b.toggled.connect(lambda on, i=i: on and on_change(i))
         h.addWidget(b, 1)
         btns.append(b)
     return row, btns
+
+
+def pill(text: str, tip: str, clickable=True) -> QPushButton:
+    """A small button that reads as pushed when on; *clickable* False: an indicator."""
+    b = QPushButton(text, checkable=True, toolTip=tip)
+    b.setStyleSheet(CHECKED.replace("4px 8px", "1px 8px") +
+                    "QPushButton{color:#8d8d8d; font-size:11px;}")
+    b.setFixedHeight(20)
+    if not clickable:
+        b.setFocusPolicy(Qt.NoFocus)
+        b.setAttribute(Qt.WA_TransparentForMouseEvents)
+    return b
+
+
+def link(text: str, on_click) -> QPushButton:
+    b = QPushButton(text, flat=True, cursor=Qt.PointingHandCursor, clicked=on_click)
+    b.setStyleSheet("QPushButton{color:#7fa8d0; border:none; text-align:left; font-size:11px;"
+                    "padding:0;}")
+    return b
 
 
 class Switch(QCheckBox):
@@ -139,6 +197,12 @@ class Switch(QCheckBox):
 
     def hitButton(self, pos):
         return self.rect().contains(pos)
+
+    def sizeHint(self):
+        return QSize(self.W + 12 + self.fontMetrics().horizontalAdvance(self.text()),
+                     self.H + 6)
+
+    minimumSizeHint = sizeHint
 
     def paintEvent(self, e):
         w, h = self.W, self.H
@@ -183,6 +247,16 @@ def slider_row(label, lo, hi, step, decimals, tip, on_change):
     return row, box
 
 
+def hbox(*ws, stretch_at=None) -> QHBoxLayout:
+    h = QHBoxLayout()
+    h.setContentsMargins(0, 0, 0, 0)
+    for i, w in enumerate(ws):
+        if i == stretch_at:
+            h.addStretch(1)
+        h.addWidget(w)
+    return h
+
+
 class _Bridge(QObject):
     call = Signal(object)
 
@@ -197,21 +271,28 @@ class SectionsTab(QWidget):
     def __init__(self, win):
         super().__init__()
         self.win = win
+        o = win.opts
         self._busy = False                         # filling widgets: no edits back
 
-        # left: the sections, the selected one's fields, its slide label
+        # left: the sections; the selected one's fields and slide label below
         self.list = QListWidget()
         self.list.setIconSize(QSize(THUMB, THUMB))
         self.list.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.list.setStyleSheet("QListWidget::item{padding:3px;}")
         self.list.currentRowChanged.connect(self._selected)
-        self.name = QLineEdit(placeholderText="what the results call it")
+        self.alias = QLineEdit()
+        self.alias.setToolTip("what this section is shown and reported as; empty: the "
+                              "scan's name. Remembered for this scan")
+        self.alias.editingFinished.connect(self._alias)
+        shorten = QPushButton("Shorten", clicked=self.shorten,
+                              toolTip="an alias for the selected sections (all, if one is "
+                                      "selected): their names without the words every one "
+                                      "has — the date, the study, the stain…")
         self.group = QComboBox(editable=True)
         self.group.lineEdit().setPlaceholderText("e.g. MI 7 d, sham")
         self.role = QComboBox()
         self.role.addItems(model.ROLES)
         self.note = QLineEdit(placeholderText="anything about this section")
-        self.name.editingFinished.connect(lambda: self._field("name", self.name.text()))
         self.group.lineEdit().editingFinished.connect(
             lambda: self._field("group", self.group.currentText()))
         self.group.activated.connect(lambda _: self._field("group", self.group.currentText()))
@@ -219,30 +300,43 @@ class SectionsTab(QWidget):
         self.note.editingFinished.connect(lambda: self._field("note", self.note.text()))
         form = QFormLayout()
         form.setContentsMargins(0, 0, 0, 0)
-        for lab, w in (("name", self.name), ("group", self.group), ("role", self.role),
-                       ("note", self.note)):
+        ar = QHBoxLayout()
+        ar.addWidget(self.alias, 1)
+        ar.addWidget(shorten)
+        form.addRow("alias", ar)
+        for lab, w in (("group", self.group), ("role", self.role), ("note", self.note)):
             form.addRow(lab, w)
+        self.scan = dim("")
+        form.addRow("scan", self.scan)
         self.label = QLabel(alignment=Qt.AlignCenter)
-        self.label.setMinimumHeight(90)
+        self.label.setMinimumHeight(60)
+        self.label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
         self.label.setToolTip("the slide's label, as the scanner photographed it")
-        add = QPushButton("Add scans…", clicked=win.add_dialog)
+        add = QPushButton("Add scans…", clicked=win.add_dialog, toolTip="CZI files (Ctrl+I)")
         rem = QPushButton("Remove", clicked=self.remove,
                           toolTip="take the selected sections out of the experiment (Del)")
-        hb = QHBoxLayout()
-        hb.addWidget(add)
-        hb.addWidget(rem)
-        left = QWidget()
-        lv = QVBoxLayout(left)
-        lv.setContentsMargins(0, 0, 0, 0)
-        lv.addLayout(hb)
-        lv.addWidget(self.list, 1)
-        lv.addLayout(form)
-        lv.addWidget(self.label)
+        top = QWidget()
+        tv = QVBoxLayout(top)
+        tv.setContentsMargins(0, 0, 0, 0)
+        tv.addLayout(hbox(add, rem))
+        tv.addWidget(self.list, 1)
+        bottom = QWidget()
+        bv = QVBoxLayout(bottom)
+        bv.setContentsMargins(0, 4, 0, 0)
+        bv.addLayout(form)
+        bv.addWidget(self.label, 1)
+        self.left = QSplitter(Qt.Vertical)
+        self.left.addWidget(top)
+        self.left.addWidget(bottom)
+        self.left.setStretchFactor(0, 1)
+        self.left.setSizes([560, 300])
 
         # centre: the slide
         self.view = SlideView()
         self.view.region_drawn.connect(self._region_drawn)
         self.view.region_clicked.connect(self._region_clicked)
+        self.view.region_edited.connect(self._region_edited)
+        self.view.draw_ended.connect(lambda: self.draw.setChecked(False))
         self.empty = QLabel(HINT, alignment=Qt.AlignCenter, wordWrap=True)
         self.empty.setStyleSheet("color:#8d8d8d; font-size:14px;")
         self.inview = dim("")
@@ -260,14 +354,22 @@ class SectionsTab(QWidget):
         pv = QVBoxLayout(panel)
         pv.setContentsMargins(4, 0, 4, 0)
         pv.setSpacing(8)
-        f, b = section("Stain")
+        folded = o["panel"]["collapsed"]
+        self.blocks = {}
+
+        def block(title, on_reset=None):
+            b = Block(title, folded.get(title, False), on_reset)
+            self.blocks[title] = b
+            pv.addWidget(b)
+            return b.v
+
+        b = block("Stain")
         row, self.prof_btns = segmented(["DAB", "SA-β-gal"], self._profile)
         self.prof_btns[0].setToolTip(analysis.PROFILES["dab"]["label"])
         self.prof_btns[1].setToolTip(analysis.PROFILES["sabg"]["label"])
         b.addWidget(row)
-        pv.addWidget(f)
 
-        f, b = section("Stained when", self._reset_rule)
+        b = block("Stained when", self._reset_rule)
         row, self.thr = slider_row(
             "hue ≥", -0.10, 0.40, 0.005, 3,
             "How far the pixel's absorbance points toward the stain: (OD · w) / ΣOD, "
@@ -286,9 +388,27 @@ class SectionsTab(QWidget):
         b.addWidget(self.own)
         self.rule_info = dim("")
         b.addWidget(self.rule_info)
-        pv.addWidget(f)
+        self.rule_more = QWidget()
+        mv = QVBoxLayout(self.rule_more)
+        mv.setContentsMargins(0, 4, 0, 0)
+        row, self.tissue_od = slider_row(
+            "tissue: OD ≥", 0.0, 0.6, 0.01, 2,
+            "A pixel is tissue when its own summed OD reaches this (0: the whole outline, "
+            "for a stain without counterstain). Shared by every section.",
+            lambda v: self._setting("tissue_od", v))
+        mv.addWidget(row)
+        row, self.outline_od = slider_row(
+            "outline: OD ≥", 0.0, 0.4, 0.005, 3,
+            "The section's outline: the absorbance smoothed over ~16 µm reaches this. "
+            "Lower: faint tissue in; higher: dust and glass smears out.",
+            lambda v: self._setting("outline_od", v))
+        mv.addWidget(row)
+        mv.addWidget(dim("What counts as tissue (Show › not counted as tissue shows it)."))
+        self.rule_more_link = link("", lambda: self._more("rule"))
+        b.addWidget(self.rule_more_link)
+        b.addWidget(self.rule_more)
 
-        f, b = section("Resolution")
+        b = block("Resolution")
         row, self.res_btns = segmented(RESOLUTIONS, self._resolution)
         tips = ["the scan's own pixels: ~4× slower, and the camera's pixel noise reads as "
                 "stain (the negative control +66 % on MI-21; ×14 on a 10× scan)",
@@ -300,50 +420,83 @@ class SectionsTab(QWidget):
         b.addWidget(row)
         self.res_info = dim("")
         b.addWidget(self.res_info)
-        pv.addWidget(f)
 
-        f, b = section("Regions")
-        rr = QHBoxLayout()
-        self.region_name = QComboBox(editable=True)
-        self.region_name.addItems(win.opts.get("region_names") or model.REGION_NAMES)
-        self.region_name.setToolTip("the name of the next region drawn; 'exclude' takes "
-                                    "its area out of the tissue (folds, debris)")
+        b = block("Regions")
+        self.kind = QComboBox(editable=True)
+        self.kind.setToolTip("what the next region is: an ROI (by its name: ROIs of one name "
+                             "are pooled) or an exclusion (folds, debris, bubbles: taken out "
+                             "of the tissue). Picking one starts drawing")
+        self.kind.activated.connect(lambda _: self.draw.setChecked(True))
         self.draw = QPushButton("Draw", checkable=True,
-                                toolTip="draw a region around what to measure: hold the "
-                                        "left button and trace (D; Esc cancels)")
+                                toolTip="click the corners of a polygon (double-click or "
+                                        "Enter closes it), or hold the left button and trace; "
+                                        "right-click or Esc cancels (D)")
+        self.draw.setStyleSheet(CHECKED)
         self.draw.toggled.connect(self.view.set_drawing)
-        rr.addWidget(self.region_name, 1)
-        rr.addWidget(self.draw)
-        b.addLayout(rr)
-        self.regions = QListWidget()
-        self.regions.setMaximumHeight(110)
-        self.regions.currentRowChanged.connect(self._region_selected)
-        self.regions.itemChanged.connect(self._region_renamed)
-        b.addWidget(self.regions)
-        b.addWidget(dim("Double-click a name to change it; Del removes the selected one."))
-        pv.addWidget(f)
+        b.addLayout(hbox(self.kind, self.draw))
+        self.kind.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.tree = QTreeWidget()
+        self.tree.setHeaderHidden(True)
+        self.tree.setColumnCount(2)
+        self.tree.header().setStretchLastSection(False)
+        self.tree.header().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.tree.header().resizeSection(1, 34)
+        self.tree.setIndentation(14)
+        self.tree.setFixedHeight(o["sizes"]["regions"])
+        self.tree.currentItemChanged.connect(self._tree_selected)
+        self.tree.itemChanged.connect(self._region_renamed)
+        b.addWidget(self.tree)
+        b.addWidget(Grip(self.tree, lambda h: self._size("regions", h)))
+        b.addWidget(dim("Click a region to select it, then drag its points; click its line "
+                        "to add one; Del removes the point (or the region). Double-click a "
+                        "name to change it."))
+        self.find_one = QPushButton("This section", clicked=lambda: self.find([self.current()]))
+        self.find_all = QPushButton("All", clicked=lambda: self.find(None))
+        for btn in (self.find_one, self.find_all):
+            btn.setToolTip("folds, bubbles, debris: found and added as excluded regions "
+                           "(found again: replaced). Options › Artefacts sets what is looked for")
+        lab = QLabel("Find artefacts")
+        b.addLayout(hbox(lab, self.find_one, self.find_all, stretch_at=1))
 
-        f, b = section("Show")
+        b = block("Show")
+        lay = win.opts["show"]
+        self.view.layers.update(lay)
         self.sw = {}
-        for key, text in (("stained", "stained"), ("tissue", "not counted as tissue"),
-                          ("regions", "regions")):
+        self.live = pill("live", "on when zoomed in far enough: the slide is read at the "
+                                 "measured resolution and coloured, live, with the current "
+                                 "rule. Zoomed out: what was measured", clickable=False)
+        self.view.live_changed.connect(self._live)
+        self.swatch = {}
+        for key, text, extra in (("stained", "stained", True), ("tissue", "not counted as tissue", True),
+                                 ("roi", "ROIs", False), ("excluded", "excluded", True),
+                                 ("scalebar", "scale bar", True)):
             s = Switch(text)
-            s.setChecked(self.view.layers[key])
-            s.toggled.connect(lambda on, k=key: self.view.set_layer(k, on))
-            b.addWidget(s)
+            s.setChecked(lay[key])
+            s.toggled.connect(lambda on, k=key: self._layer(k, on))
             self.sw[key] = s
-        pv.addWidget(f)
+            row = [s]
+            if key == "stained":
+                row.append(self.live)
+            if extra:
+                c = ColorButton("#000000", size=(22, 14))
+                c.picked.connect(lambda col, k=key: self._pick_colour(k, col))
+                self.swatch[key] = c
+                row.append(c)
+            b.addLayout(hbox(*row, stretch_at=1))
+        self.wb = pill("auto", "white balance: the glass shown white, from each section's "
+                               "own glass. Only what is shown; the measurement takes OD "
+                               "against the glass anyway")
+        self.wb.setChecked(lay["wb"])
+        self.wb.toggled.connect(lambda on: self._layer("wb", on))
+        b.addLayout(hbox(QLabel("white balance"), self.wb, stretch_at=1))
 
-        f, b = section("Measure")
-        hb = QHBoxLayout()
+        b = block("Measure")
         self.go_one = QPushButton("This section", clicked=lambda: win.measure(self.current()))
         self.go_all = QPushButton("All", clicked=lambda: win.measure(None),
                                   toolTip="every section not measured yet, or measured with "
                                           "other settings or regions (Ctrl+M)")
         self.stop = QPushButton("Stop", clicked=win.stop_measure, enabled=False)
-        for w in (self.go_one, self.go_all, self.stop):
-            hb.addWidget(w)
-        b.addLayout(hb)
+        b.addLayout(hbox(self.go_one, self.go_all, self.stop))
         self.bar = QProgressBar(textVisible=False, maximumHeight=8)
         b.addWidget(self.bar)
         self.progress = dim("")
@@ -353,32 +506,90 @@ class SectionsTab(QWidget):
         self.result.verticalHeader().hide()
         self.result.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
         self.result.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        self.result.setMaximumHeight(130)
+        self.result.setFixedHeight(o["sizes"]["measure"])
         b.addWidget(self.result)
+        b.addWidget(Grip(self.result, lambda h: self._size("measure", h)))
         self.state = dim("")
         b.addWidget(self.state)
-        pv.addWidget(f)
+        self.measure_more_link = link("", lambda: self._more("measure"))
+        b.addWidget(self.measure_more_link)
+        self.more = {"rule": o["panel"]["more_rule"], "measure": o["panel"]["more_measure"]}
         pv.addStretch()
         scroll = QScrollArea(widgetResizable=True)
         scroll.setFrameShape(QFrame.NoFrame)
         scroll.setWidget(panel)
         scroll.setMinimumWidth(300)
 
-        split = QSplitter()
-        split.addWidget(left)
-        split.addWidget(centre)
-        split.addWidget(scroll)
-        split.setStretchFactor(1, 1)
-        split.setSizes([260, 900, 320])
+        self.split = QSplitter()
+        self.split.addWidget(self.left)
+        self.split.addWidget(centre)
+        self.split.addWidget(scroll)
+        self.split.setStretchFactor(1, 1)
+        self.split.setSizes([260, 900, 330])
         v = QVBoxLayout(self)
         v.setContentsMargins(0, 0, 0, 0)
-        v.addWidget(split)
+        v.addWidget(self.split)
 
         for key, fn in (("D", lambda: self.draw.toggle()), ("F", self.view.fit),
                         ("Ctrl+M", lambda: win.measure(None))):
             QShortcut(QKeySequence(key), self, activated=fn)
         QShortcut(QKeySequence.Delete, self, activated=self._delete)
+        self.apply_options()
+        self._more(None)
         self.sync_settings()
+
+    # -- options
+    def apply_options(self):
+        """Colours, the names offered, the view's style: from the options."""
+        o = self.win.opts
+        cur = self.kind.currentText()
+        self.kind.blockSignals(True)
+        self.kind.clear()
+        self.kind.addItems(["ROI", *self.win.preset(), "exclude"])
+        self.kind.setCurrentText(cur if cur else "ROI")
+        self.kind.blockSignals(False)
+        self.view.set_style(self.win.view_style(), self.win.roi_colour)
+        for k, c in self.swatch.items():
+            c.set(self.win.colour(k))
+        if self.current() is not None:
+            self.fill_regions(self._region_index())
+            self._show_label_again()
+
+    def _show_label_again(self):
+        s = self.current()
+        if s is not None:
+            self.win._show_label(s)
+
+    def _pick_colour(self, key, col):
+        o = self.win.opts
+        if key == "stained":
+            o["colours"]["stained_" + self.win.exp.settings.profile] = col
+        else:
+            o["colours"][key] = col
+        self.win.save_options()
+        self.win.apply_options("colours")
+
+    def _size(self, key, h):
+        self.win.opts["sizes"][key] = h
+        self.win.save_options()
+
+    def _more(self, which):
+        if which:
+            self.more[which] = not self.more[which]
+        self.rule_more.setVisible(self.more["rule"])
+        self.rule_more_link.setText("less ▴" if self.more["rule"] else "more ▾")
+        self.measure_more_link.setText("less ▴" if self.more["measure"] else
+                                       "more ▾  (whole section, excluded, details)")
+        if which == "measure":
+            self.fill_result()
+
+    def _layer(self, key, on):
+        self.view.set_layer(key, on)
+        if key == "stained":
+            self._live(self.view.live)
+
+    def _live(self, on):
+        self.live.setChecked(on and self.sw["stained"].isChecked())
 
     # -- helpers
     def current(self) -> model.Section | None:
@@ -390,13 +601,14 @@ class SectionsTab(QWidget):
         s = self.current()
         exp = self.win.exp
         st = exp.settings_for(s) if s is not None else exp.settings
-        for w in (*self.prof_btns, *self.res_btns, self.thr, self.minod):
+        boxes = (self.thr, self.minod, self.tissue_od, self.outline_od)
+        for w in (*self.prof_btns, *self.res_btns, *boxes):
             w.blockSignals(True)
         self.prof_btns[list(analysis.PROFILES).index(st.profile)].setChecked(True)
         self.res_btns[min(max(st.level, 0), 2)].setChecked(True)
-        self.thr.setValue(st.threshold)
-        self.minod.setValue(st.min_od)
-        for w in (*self.prof_btns, *self.res_btns, self.thr, self.minod):
+        for box, k in zip(boxes, ("threshold", "min_od", "tissue_od", "outline_od")):
+            box.setValue(getattr(st, k))
+        for w in (*self.prof_btns, *self.res_btns, *boxes):
             w.blockSignals(False)
         own = s is not None and bool(s.rule)
         self.own.blockSignals(True)
@@ -408,11 +620,12 @@ class SectionsTab(QWidget):
             f"This section only; the others: hue ≥ {g.threshold:g}, summed OD ≥ {g.min_od:g}."
             if own else "Shared by every section. Zoom in: the view shows, live, what the rule "
                         "calls stained.")
-        for box in (self.thr, self.minod):                  # the slider follows the box
+        for box in boxes:                                   # the slider follows the box
             sl = box.parentWidget().findChild(QSlider)
             sl.blockSignals(True)
             sl.setValue(int(round(box.value() / box.singleStep())))
             sl.blockSignals(False)
+        self.swatch["stained"].set(self.win.colour("stained"))
         self.view.set_settings(st)
 
     def refresh(self):
@@ -423,6 +636,7 @@ class SectionsTab(QWidget):
         self.list.clear()
         for s in exp.sections:
             it = QListWidgetItem(self._item_text(s))
+            it.setToolTip(s.name)
             pm = self.win.thumbs.get(s.key)
             if pm is not None:
                 it.setIcon(QIcon(pm))
@@ -447,7 +661,7 @@ class SectionsTab(QWidget):
         pct = s.result["rows"][0]["pct"] if s.result and s.result["rows"] else None
         tail = (f"{fmt(pct)} % stained" if st == "measured" else
                 f"{fmt(pct)} % — {st}" if s.result else st)
-        return f"{s.name}\n{s.group or '–'} · {s.role} · {tail}{' · own rule' if s.rule else ''}"
+        return f"{s.shown}\n{s.group or '–'} · {s.role} · {tail}{' · own rule' if s.rule else ''}"
 
     def _todo(self):
         exp = self.win.exp
@@ -461,46 +675,104 @@ class SectionsTab(QWidget):
         if s is None:
             return
         self._busy = True
-        self.name.setText(s.name)
+        self.alias.setText(s.alias)
+        self.alias.setPlaceholderText(s.name)
         self.group.setCurrentText(s.group)
         self.role.setCurrentText(s.role)
         self.note.setText(s.note)
+        self.scan.setText(s.scan)
         self._busy = False
+        self.draw.setChecked(False)
         self.win.show_section(s, force=force)
         self.sync_settings()
         self._res_info()
         self.fill_regions()
         self.fill_result()
 
+    def _region_index(self) -> int:
+        it = self.tree.currentItem()
+        return it.data(0, Qt.UserRole) if it is not None else -1
+
+    def _labels(self, s) -> dict:
+        """The ROIs' % stained, by region index, for the view."""
+        if not s.result or self.win.exp.stale(s):
+            return {}
+        pct = {r["region"]: r["pct"] for r in s.result.get("rows", [])}
+        return {i: f"{pct[r['name']]:.2f} %" for i, r in enumerate(s.regions)
+                if r["kind"] == "roi" and pct.get(r["name"]) is not None}
+
     def fill_regions(self, select: int = -1):
         s = self.current()
-        self.regions.blockSignals(True)
-        self.regions.clear()
-        labels = {}
+        self.tree.blockSignals(True)
+        open_ = self.tree.topLevelItemCount() and any(
+            self.tree.topLevelItem(k).isExpanded() for k in range(self.tree.topLevelItemCount())
+            if self.tree.topLevelItem(k).data(0, Qt.UserRole) == -1)
+        self.tree.clear()
+        excl_node, pick = None, None
         if s is not None:
-            res = {r["region"]: r for r in (s.result.get("rows", []) if s.result else [])}
             for i, r in enumerate(s.regions):
-                it = QListWidgetItem(r["name"])
+                it = QTreeWidgetItem([r["name"], ""])
+                it.setData(0, Qt.UserRole, i)
                 it.setFlags(it.flags() | Qt.ItemIsEditable)
-                it.setForeground(region_colour(r["name"], i))
-                self.regions.addItem(it)
-                m = res.get(r["name"])
-                if m and m["pct"] is not None and not self.win.exp.stale(s):
-                    labels[i] = f"{m['pct']:.2f} %"
-            self.regions.setCurrentRow(select)
-        self.regions.blockSignals(False)
-        self.view.set_regions(s.regions if s else [], select, labels)
+                if r["kind"] == "exclude":
+                    if excl_node is None:
+                        excl_node = QTreeWidgetItem(["excluded", ""])
+                        excl_node.setData(0, Qt.UserRole, -1)
+                        excl_node.setFlags(excl_node.flags() & ~Qt.ItemIsEditable)
+                    excl_node.addChild(it)
+                    it.setToolTip(0, "excluded" + (" (found)" if r.get("auto") else ""))
+                else:
+                    self.tree.addTopLevelItem(it)
+                    it.setForeground(0, self.win.roi_colour(r["name"]))
+                    c = ColorButton(self.win.roi_colour(r["name"]).name(), size=(22, 14),
+                                    tip=f"the colour of every ROI named {r['name']}")
+                    c.picked.connect(lambda col, n=r["name"]: self._roi_colour(n, col))
+                    self.tree.setItemWidget(it, 1, c)
+                if i == select:
+                    pick = it
+            if excl_node is not None:
+                self.tree.addTopLevelItem(excl_node)
+                n = excl_node.childCount()
+                excl_node.setText(0, f"excluded ({n})")
+                excl_node.setForeground(0, QColor(self.win.colour("excluded")))
+                c = ColorButton(self.win.colour("excluded"), size=(22, 14),
+                                tip="the colour of the excluded regions")
+                c.picked.connect(lambda col: self._pick_colour("excluded", col))
+                self.tree.setItemWidget(excl_node, 1, c)
+                excl_node.setExpanded(bool(open_) or (pick is not None and pick.parent() is excl_node))
+        if pick is not None:
+            self.tree.setCurrentItem(pick)
+        self.tree.blockSignals(False)
+        self.view.set_regions(s.regions if s else [], select if pick is not None else -1,
+                              self._labels(s) if s else {})
+
+    def _roi_colour(self, name, col):
+        self.win.opts["region_colours"][name] = col
+        self.win.save_options()
+        self.win.apply_options("region_colours")
 
     def fill_result(self):
         s = self.current()
         exp = self.win.exp
         rows = s.result.get("rows", []) if (s and s.result) else []
-        self.result.setRowCount(len(rows))
-        for i, r in enumerate(rows):
-            for j, v in enumerate((r["region"], fmt(r["tissue_mm2"], 3), fmt(r["pct"]))):
+        more = self.more["measure"]
+        shown = []
+        if rows:
+            whole, rest = rows[0], [r for r in rows[1:] if r["region"] != analysis.REST]
+            tail = [r for r in rows[1:] if r["region"] == analysis.REST]
+            shown = ([whole] if more or not rest else []) + rest + tail
+            if more and s.result.get("excluded_mm2") is not None:
+                shown.append({"region": "excluded", "tissue_mm2": s.result["excluded_mm2"],
+                              "pct": None})
+        self.result.setRowCount(len(shown))
+        for i, r in enumerate(shown):
+            name = analysis.WHOLE if r["region"] == "section" else r["region"]
+            for j, v in enumerate((name, fmt(r["tissue_mm2"], 3), fmt(r["pct"]))):
                 it = QTableWidgetItem(v)
                 if j:
                     it.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                if r["region"] in (analysis.REST, "excluded"):
+                    it.setForeground(QColor("#a8a8a8"))
                 self.result.setItem(i, j, it)
         if s is None:
             self.state.setText("")
@@ -512,8 +784,8 @@ class SectionsTab(QWidget):
             r = s.result
             self.state.setText(
                 ("⚠ settings or regions changed since: Measure again. " if exp.stale(s) else "")
-                + f"{r['um_per_px']:g} µm/px, {r['tiles']} tiles in {r['seconds']:g} s, "
-                  f"glass RGB {', '.join(f'{g:.0f}' for g in r['glass'])}")
+                + (f"{r['um_per_px']:g} µm/px, {r['tiles']} tiles in {r['seconds']:g} s, "
+                   f"glass RGB {', '.join(f'{g:.0f}' for g in r['glass'])}" if more else ""))
 
     # -- edits
     def _field(self, key, value):
@@ -522,10 +794,38 @@ class SectionsTab(QWidget):
             return
         self.win.snap()
         for i in self._rows():
-            if key == "name" and i != self.list.currentRow():
-                continue                                  # a name is one section's
             setattr(self.win.exp.sections[i], key, value)
         self.win.changed()
+
+    def _alias(self):
+        s = self.current()
+        text = self.alias.text().strip()
+        if self._busy or s is None or text == s.alias:
+            return
+        self.win.snap()
+        self._set_aliases({s.name: text}, [s])
+
+    def _set_aliases(self, by_name: dict, secs):
+        al = self.win.opts["aliases"]
+        for s in secs:
+            s.alias = by_name[s.name]
+            if s.alias:
+                al[s.name] = s.alias
+            else:
+                al.pop(s.name, None)
+        self.win.save_options()
+        self.win.changed()
+
+    def shorten(self):
+        rows = self._rows()
+        secs = [self.win.exp.sections[i] for i in rows] if len(rows) > 1 else self.win.exp.sections
+        if len(secs) < 2:
+            self.win.log("Shorten: needs two sections at least, to see what their names share")
+            return
+        self.win.snap()
+        short = model.short_names([s.name for s in secs])
+        self._set_aliases({s.name: a for s, a in zip(secs, short)}, secs)
+        self.win.log(f"✓ {len(secs)} aliases: " + ", ".join(short[:4]) + (" …" if len(secs) > 4 else ""))
 
     def _rows(self) -> list[int]:
         rows = sorted({self.list.row(it) for it in self.list.selectedItems()})
@@ -541,10 +841,12 @@ class SectionsTab(QWidget):
         self.win.changed()
 
     def _delete(self):
-        if self.regions.hasFocus() or self.regions.currentRow() >= 0 and not self.list.hasFocus():
-            self._remove_region()
-        elif self.list.hasFocus():
+        if self.list.hasFocus():
             self.remove()
+        elif self.view.node is not None and self.view.delete_node():
+            pass
+        elif self._region_index() >= 0:
+            self._remove_region()
 
     def _setting(self, key, value):
         exp = self.win.exp
@@ -559,6 +861,8 @@ class SectionsTab(QWidget):
                 return
             self.win.snap()
             exp.settings = replace(exp.settings, **{key: value})
+        if key in ("tissue_od", "outline_od"):
+            self.win.show_base(s)
         self.view.set_settings(exp.settings_for(s) if s is not None else exp.settings)
         self.win.changed(view=False)
 
@@ -577,26 +881,26 @@ class SectionsTab(QWidget):
         if key == self.win.exp.settings.profile:
             return
         self.win.snap()
-        p = analysis.PROFILES[key]
-        self.win.exp.settings = replace(self.win.exp.settings, profile=key,
-                                        threshold=p["threshold"], min_od=p["min_od"])
+        self.win.exp.settings = analysis.Settings.of(key, self.win.exp.settings.level)
         own = [s for s in self.win.exp.sections if s.rule]
         for s in own:                                     # another stain's numbers
             s.rule = {}
         if own:
             self.win.log(f"own rules cleared ({len(own)} sections): they were for the other stain")
+        self.win.show_base(self.current())
+        self.win.apply_options("colours")
         self.sync_settings()
         self.win.changed(view=False)
 
     def _reset_rule(self):
-        p = analysis.PROFILES[self.win.exp.settings.profile]
         self.win.snap()
         s = self.current()
         if s is not None and s.rule:                      # back to the shared rule
             s.rule = {}
         else:
-            self.win.exp.settings = replace(self.win.exp.settings, threshold=p["threshold"],
-                                            min_od=p["min_od"])
+            st = self.win.exp.settings
+            self.win.exp.settings = analysis.Settings.of(st.profile, st.level)
+            self.win.show_base(s)
         self.sync_settings()
         self.win.changed(view=False)
 
@@ -611,51 +915,112 @@ class SectionsTab(QWidget):
             self.res_info.setText(f"this scan: {s.scene.px_um:.2f} µm/px → measured at "
                                   f"{s.scene.px_um * 2 ** lv:.2f} µm/px")
 
-    def _region_drawn(self, pts):
+    # -- regions
+    def _region_drawn(self, pts, nodes):
         s = self.current()
         if s is None:
             return
-        name = self.region_name.currentText().strip() or "region"
+        text = self.kind.currentText().strip() or "ROI"
+        if text.lower() == "exclude":
+            r = {"name": model.next_name(s.regions, "exclude"), "kind": "exclude"}
+        elif text == "ROI":
+            r = {"name": model.next_name(s.regions, "ROI"), "kind": "roi"}
+        else:
+            r = {"name": text, "kind": "roi"}
+        r["points"] = pts
+        if nodes is not None:
+            r["nodes"] = nodes
         self.win.snap()
-        s.regions.append({"name": name, "points": pts})
-        names = self.win.opts.setdefault("region_names", list(model.REGION_NAMES))
-        if name not in names:
-            names.append(name)
-            self.region_name.addItem(name)
-            self.win.save_options()
+        s.regions.append(r)
         self.draw.setChecked(False)
-        self.win.changed(view=False)
-        self.fill_regions(len(s.regions) - 1)
+        self.win.changed(view=False, select=len(s.regions) - 1)
 
     def _region_clicked(self, i):
-        self.regions.setCurrentRow(i)
+        if i < 0:
+            self.tree.setCurrentItem(None)
+            self._tree_selected(None)
+            return
+        self.fill_regions(i)
 
-    def _region_selected(self, i):
+    def _tree_selected(self, it, *_):
         s = self.current()
         if s is not None:
+            i = it.data(0, Qt.UserRole) if it is not None else -1
             self.view.set_regions(s.regions, i, self.view.labels)
 
-    def _region_renamed(self, it):
+    def _region_edited(self, i, r):
         s = self.current()
-        i = self.regions.row(it)
         if s is None or not (0 <= i < len(s.regions)):
             return
-        name = it.text().strip()
+        self.win.snap()
+        s.regions[i] = r
+        self.win.changed(view=False, select=i)
+
+    def _region_renamed(self, it, _col):
+        s = self.current()
+        i = it.data(0, Qt.UserRole)
+        if s is None or i is None or not (0 <= i < len(s.regions)):
+            return
+        name = it.text(0).strip()
         if name and name != s.regions[i]["name"]:
             self.win.snap()
             s.regions[i]["name"] = name
-            self.win.changed(view=False)
-            self.fill_regions(i)
+            self.win.changed(view=False, select=i)
 
     def _remove_region(self):
         s = self.current()
-        i = self.regions.currentRow()
+        i = self._region_index()
         if s is None or not (0 <= i < len(s.regions)):
             return
         self.win.snap()
         del s.regions[i]
         self.win.changed(view=False)
-        self.fill_regions()
+
+    def find(self, secs):
+        """Folds, bubbles, debris: found off the GUI thread, added as excluded regions."""
+        exp = self.win.exp
+        secs = [s for s in (secs or exp.sections) if s is not None and s.scene is not None
+                and s.role != "left out"]
+        if not secs or not self.find_one.isEnabled():
+            return
+        a = self.win.opts["artefacts"]
+        kinds = {k for k in options.ARTEFACTS if a[k]}
+        jobs = [(s, s.scene, exp.settings_for(s)) for s in secs]
+        for b in (self.find_one, self.find_all):
+            b.setEnabled(False)
+        self.win.log(f"looking for {', '.join(sorted(kinds)) or 'nothing'} in "
+                     f"{len(jobs)} section(s)…")
+
+        def work():
+            out = []
+            for s, sc, st in jobs:
+                try:
+                    out.append((s, [f for f in analysis.find_artefacts(sc, st, a["factor"],
+                                                                       a["min_mm2"])
+                                    if f[0] in kinds]))
+                except Exception as e:
+                    self.win.later(lambda s=s, e=e: self.win.log(f"✗ {s.shown}: {e}"))
+            self.win.later(lambda: self._found(out))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _found(self, out):
+        for b in (self.find_one, self.find_all):
+            b.setEnabled(True)
+        out = [(s, f) for s, f in out if s in self.win.exp.sections]
+        if not out:
+            return
+        self.win.snap()
+        for s, found in out:
+            keep = [r for r in s.regions if not r.get("auto")]
+            for what, pts in found:
+                keep.append({"name": model.next_name(keep, {"fold": "tissue fold"}.get(what, what)),
+                             "kind": "exclude", "auto": True, "points": pts, "nodes": []})
+            s.regions = keep
+            n = {w: sum(1 for x, _ in found if x == w) for w in options.ARTEFACTS}
+            self.win.log(f"✓ {s.shown}: " + (", ".join(f"{v} {options.ARTEFACTS[k]}"
+                                                       for k, v in n.items() if v)
+                                             or "nothing found") + " — excluded")
+        self.win.changed(view=False)
 
 
 # --- Results tab -------------------------------------------------------------------------
@@ -664,7 +1029,7 @@ class ResultsTab(QWidget):
     COLS = [("section", "section"), ("group", "group"), ("role", "role"),
             ("region", "region"), ("tissue_mm2", "tissue mm²"), ("stained_mm2", "stained mm²"),
             ("pct", "% stained"), ("mean_od", "mean OD"), ("threshold", "hue ≥"),
-            ("min_od", "OD ≥"), ("rule", "rule"), ("state", "state")]
+            ("min_od", "OD ≥"), ("rule", "rule"), ("state", "state"), ("scan", "scan")]
 
     def __init__(self, win):
         super().__init__()
@@ -729,6 +1094,11 @@ class ResultsTab(QWidget):
             self.region.setCurrentText(cur)
         self._plot()
 
+    def _stain(self):
+        st = self.win.exp.settings
+        return ("DAB" if st.profile == "dab" else "SA-β-gal",
+                QColor(self.win.colour("stained")).getRgb()[:3])
+
     def _plot(self):
         region = self.region.currentText()
         rows = self.win.exp.rows()
@@ -745,14 +1115,13 @@ class ResultsTab(QWidget):
             return
         from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
         from . import plot
-        st = self.win.exp.settings
-        stain = "DAB" if st.profile == "dab" else "SA-β-gal"
+        stain, colour = self._stain()
         if self.canvas is None:
-            self.fig = plot.figure(sm, region, stain, analysis.PROFILES[st.profile]["colour"])
+            self.fig = plot.figure(sm, region, stain, colour)
             self.canvas = FigureCanvasQTAgg(self.fig)
             self.canvas_box.addWidget(self.canvas, 1)
         else:
-            plot.figure(sm, region, stain, analysis.PROFILES[st.profile]["colour"], fig=self.fig)
+            plot.figure(sm, region, stain, colour, fig=self.fig)
             self.canvas.draw_idle()
         self.canvas.show()
 
@@ -772,11 +1141,10 @@ class ResultsTab(QWidget):
             "PNG (*.png);;SVG (*.svg);;PDF (*.pdf)")
         if p:
             from . import plot
-            st = self.win.exp.settings
             region = self.region.currentText()
-            f = plot.figure(model.summary(self.win.exp.rows(), region), region,
-                            "DAB" if st.profile == "dab" else "SA-β-gal",
-                            analysis.PROFILES[st.profile]["colour"], dark=False)
+            stain, colour = self._stain()
+            f = plot.figure(model.summary(self.win.exp.rows(), region), region, stain, colour,
+                            dark=False)
             f.savefig(p, dpi=300)
             self.win.log(f"✓ figure saved: {p}")
 
@@ -848,18 +1216,23 @@ class MainWindow(QMainWindow):
     def __init__(self):
         QLocale.setDefault(QLocale.c())
         super().__init__()
-        self.opts = load_options()
+        self.opts = options.load(OPTIONS)
         sys.excepthook = self._error
-        self.exp = model.Experiment()
+        self.exp = model.Experiment(settings=analysis.Settings.of(self.opts["new"]["profile"],
+                                                                  self.opts["new"]["level"]))
         self.undo, self.redo = [], []
         self.dirty = False
         self.thumbs: dict = {}                     # section key -> QPixmap
-        self.overviews: dict = {}                  # section key -> (rgb, zoom, glass)
+        self.overviews: dict = {}                  # section key -> (rgb, zoom)
+        self.bases: dict = {}                      # (section key, outline settings) -> glass, outline
         self.decoded: dict = {}                    # (section key, fingerprint) -> maps
         self.labels: dict = {}                     # file -> QPixmap or None
         self._bridge = _Bridge()
         self._bridge.call.connect(lambda f: f())
         self._cancel = None
+        self._ahead: queue.Queue = queue.Queue()
+        threading.Thread(target=self._read_ahead, daemon=True).start()
+        self.options_window = None
         self.resize(1500, 920)
         self.setAcceptDrops(True)
 
@@ -871,8 +1244,10 @@ class MainWindow(QMainWindow):
                         (self.record_tab, "Experiment")):
             self.tabs.addTab(w, name)
         self.tabs.currentChanged.connect(lambda _: self._refresh_tab())
-        self.logbox = QPlainTextEdit(readOnly=True, maximumHeight=90)
-        self.logbox.setPlaceholderText("What happened, and what looks wrong (✗ ⚠)")
+        self.logbox = QPlainTextEdit(readOnly=True)
+        self.logbox.setMinimumHeight(0)
+        self.logbox.setPlaceholderText("What happened, and what looks wrong (✗ ⚠). "
+                                       "Drag the bar above down to close it.")
 
         bar = self.addToolBar("main")
         bar.setMovable(False)
@@ -882,8 +1257,10 @@ class MainWindow(QMainWindow):
                                             "settings, results", self.save),
                 ("Save as…", QKeySequence.SaveAs, "", self.save_as),
                 (None, None, None, None),
-                ("Add scans…", "Ctrl+I", "CZI files, or a folder of them", self.add_dialog),
-                ("Export results…", "Ctrl+E", ".xlsx or .csv", self.export_dialog)]:
+                ("Export results…", "Ctrl+E", ".xlsx or .csv", self.export_dialog),
+                (None, None, None, None),
+                ("Options…", "Ctrl+,", "colours, what the panel starts with, names offered "
+                                       "for regions, artefacts, aliases…", self.show_options)]:
             if text is None:
                 bar.addSeparator()
                 continue
@@ -891,17 +1268,68 @@ class MainWindow(QMainWindow):
             a.setShortcut(QKeySequence(key))
             bar.addAction(a)
         for key, fn in ((QKeySequence.Undo, self.do_undo), (QKeySequence.Redo, self.do_redo),
-                        (QKeySequence("Ctrl+Shift+Z"), self.do_redo)):
+                        (QKeySequence("Ctrl+Shift+Z"), self.do_redo),
+                        (QKeySequence("Ctrl+I"), self.add_dialog)):
             self.addAction(QAction(self, shortcut=key, triggered=fn))
 
+        self.vsplit = QSplitter(Qt.Vertical)
+        self.vsplit.addWidget(self.tabs)
+        self.vsplit.addWidget(self.logbox)
+        self.vsplit.setCollapsible(0, False)
+        self.vsplit.setStretchFactor(0, 1)
+        self.vsplit.setSizes([800, 90])
         central = QWidget()
         v = QVBoxLayout(central)
-        v.addWidget(self.tabs, 1)
-        v.addWidget(self.logbox)
+        v.addWidget(self.vsplit)
         self.setCentralWidget(central)
+        sz = self.opts["sizes"]
+        for key, sp in (("main", self.sections_tab.split), ("log", self.vsplit),
+                        ("left", self.sections_tab.left)):
+            if len(sz[key]) == sp.count() and all(isinstance(x, int) for x in sz[key]):
+                sp.setSizes(sz[key])
         guard_wheel(self)
         self.refresh_all()
         self._title()
+
+    # -- options
+    def save_options(self):
+        if not options.save(self.opts, OPTIONS):
+            self.log(f"⚠ options not saved: {OPTIONS}")
+
+    def preset(self) -> list[str]:
+        r = self.opts["regions"]
+        return r["presets"].get(r["preset"], [])
+
+    def colour(self, key: str) -> str:
+        c = self.opts["colours"]
+        return c["stained_" + self.exp.settings.profile] if key == "stained" else c[key]
+
+    def roi_colour(self, name: str) -> QColor:
+        c = self.opts["region_colours"].get(name)
+        if c:
+            return QColor(c)
+        pre = self.preset()
+        return QColor(REGION_COLOURS[pre.index(name) % len(REGION_COLOURS)]) if name in pre \
+            else default_colour(name)
+
+    def view_style(self) -> dict:
+        v = self.opts["view"]
+        return {"stained": QColor(self.colour("stained")).getRgb()[:3],
+                "tissue": self.colour("tissue"), "excluded": self.colour("excluded"),
+                "scalebar": self.colour("scalebar"), "white": v["white"], "badge": v["badge"],
+                "bar_pos": v["bar_pos"], "bar_um": v["bar_um"],
+                "excl_as_tissue": v["excl_as_tissue"]}
+
+    def apply_options(self, topic):
+        """An option changed (*topic*: its key, None: all): the window follows."""
+        self.sections_tab.apply_options()
+        if topic in (None, "colours"):
+            self._refresh_tab()
+
+    def show_options(self):
+        if self.options_window is None:
+            self.options_window = options.OptionsWindow(self)
+        self.options_window.open()
 
     # -- bookkeeping
     def _error(self, kind, err, tb):
@@ -921,7 +1349,8 @@ class MainWindow(QMainWindow):
 
     def log(self, *lines):
         for line in lines:
-            self.logbox.appendPlainText(line)
+            if line:
+                self.logbox.appendPlainText(line)
 
     def later(self, fn):
         """Run *fn* on the GUI thread (from a worker)."""
@@ -929,13 +1358,6 @@ class MainWindow(QMainWindow):
             self._bridge.call.emit(fn)
         except RuntimeError:                      # the window is gone (closing)
             pass
-
-    def save_options(self):
-        try:
-            OPTIONS.write_text(json.dumps(self.opts, indent=1, ensure_ascii=False),
-                               encoding="utf-8")
-        except OSError as e:
-            self.log(f"⚠ options not saved: {e}")
 
     def stem(self) -> str:
         if self.exp.path:
@@ -961,6 +1383,7 @@ class MainWindow(QMainWindow):
         e.acquisition = self.exp.acquisition
         self.exp = e
         self.sections_tab.sync_settings()
+        self.show_base(self.sections_tab.current())
         self.changed()
 
     def do_undo(self):
@@ -973,7 +1396,7 @@ class MainWindow(QMainWindow):
             self.undo.append(json.dumps(self.exp.to_dict(maps=False), default=float))
             self._restore(self.redo.pop())
 
-    def changed(self, view=True):
+    def changed(self, view=True, select=None):
         self.dirty = True
         self._title()
         if view:
@@ -985,7 +1408,7 @@ class MainWindow(QMainWindow):
                     st.list.item(i).setText(st._item_text(s))
             st._todo()
             st.fill_result()
-            st.fill_regions(st.regions.currentRow())
+            st.fill_regions(st._region_index() if select is None else select)
             self.show_maps(st.current())
             self._refresh_tab()
 
@@ -1024,7 +1447,7 @@ class MainWindow(QMainWindow):
         QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
             self.snap()
-            new, notes = self.exp.add(paths)
+            new, notes = self.exp.add(paths, self.opts["aliases"])
         finally:
             QApplication.restoreOverrideCursor()
         self.log(*[f"⚠ {n}" for n in notes])
@@ -1049,12 +1472,15 @@ class MainWindow(QMainWindow):
                     sc = s.scene
                     z = level_for(max(sc.w, sc.h), THUMB * 2)
                     rgb = czi.read(sc, 0, 0, sc.w, sc.h, z)
-                    rgb[(rgb.max(2) <= 5) | (rgb.min(2) >= 250)] = 60     # padding: dark
-                    img = to_qimage(rgb).scaled(THUMB, THUMB, Qt.KeepAspectRatio,
-                                                Qt.SmoothTransformation)
+                    # ponytail: always white-balanced (a preview); follows no toggle
+                    shown = display(rgb, wb_lut(analysis.estimate_glass(rgb),
+                                                self.opts["view"]["white"]))
+                    shown[(rgb.max(2) <= 5) | (rgb.min(2) >= 250)] = 60     # padding: dark
+                    img = to_qimage(shown).scaled(THUMB, THUMB, Qt.KeepAspectRatio,
+                                                  Qt.SmoothTransformation)
                     self.later(lambda s=s, img=img: self._thumb_ready(s, img))
                 except Exception as e:
-                    self.later(lambda s=s, e=e: self.log(f"⚠ {s.name}: no thumbnail ({e})"))
+                    self.later(lambda s=s, e=e: self.log(f"⚠ {s.shown}: no thumbnail ({e})"))
         threading.Thread(target=work, daemon=True).start()
 
     def _thumb_ready(self, s, img):
@@ -1090,6 +1516,7 @@ class MainWindow(QMainWindow):
         self.save_options()
         self.log(f"✓ opened {p.name}", *[f"⚠ {x}" for x in problems])
         self.sections_tab.sync_settings()
+        self.apply_options("colours")
         self.refresh_all()
         self._title()
         self._load_thumbs(exp.sections)
@@ -1143,11 +1570,55 @@ class MainWindow(QMainWindow):
         if self._cancel is not None:
             self._cancel.set()
         if self._may_discard():
+            sz = self.opts["sizes"]
+            sz.update(main=self.sections_tab.split.sizes(), log=self.vsplit.sizes(),
+                      left=self.sections_tab.left.sizes())
+            self.save_options()
             e.accept()
         else:
             e.ignore()
 
-    # -- the slide
+    # -- the slide: its overview and base (glass, outline), read once, the next ones ahead
+    def _base_key(self, s, st):
+        return (s.key, st.profile, st.outline_od, st.tissue_od > 0)
+
+    def _overview(self, sc):
+        z = level_for(max(sc.w, sc.h), 2400)
+        return czi.read(sc, 0, 0, sc.w, sc.h, z), z
+
+    def _read_ahead(self):
+        """The sections beside the one shown, read while it is looked at."""
+        while True:
+            s, st = self._ahead.get()
+            try:
+                if s.key not in self.overviews:
+                    ov = self._overview(s.scene)
+                    self.later(lambda s=s, ov=ov: self.overviews.setdefault(s.key, ov))
+                k = self._base_key(s, st)
+                if k not in self.bases:
+                    b = analysis.base(s.scene, st)
+                    self.later(lambda k=k, b=b: self.bases.setdefault(k, b))
+            except Exception:
+                pass                                  # read again, and reported, when shown
+
+    def _trim(self):
+        for d, n in ((self.overviews, 8), (self.bases, 16)):
+            while len(d) > n:
+                d.pop(next(iter(d)))
+
+    def base_of(self, s):
+        st = self.exp.settings_for(s)
+        k = self._base_key(s, st)
+        if k not in self.bases:
+            self.bases[k] = analysis.base(s.scene, st)
+            self._trim()
+        return self.bases[k]
+
+    def show_base(self, s):
+        """The outline again (other tissue or outline settings, another stain)."""
+        if s is not None and s.scene is not None and self.sections_tab.view.sc is s.scene:
+            self.sections_tab.view.set_base(*self.base_of(s))
+
     def show_section(self, s: model.Section, force=True):
         view = self.sections_tab.view
         if s.scene is None:
@@ -1156,28 +1627,27 @@ class MainWindow(QMainWindow):
         if view.sc is s.scene and not force:
             self.show_maps(s)
             return
-        ov = self.overviews.get(s.key)
-        if ov is None:
-            QApplication.setOverrideCursor(Qt.WaitCursor)
-            try:
-                sc = s.scene
-                z = level_for(max(sc.w, sc.h), 2400)
-                rgb = czi.read(sc, 0, 0, sc.w, sc.h, z)
-                ov = (rgb, z, analysis.estimate_glass(rgb))
-                self.overviews[s.key] = ov
-                while len(self.overviews) > 6:
-                    self.overviews.pop(next(iter(self.overviews)))
-            except Exception as e:
-                QApplication.restoreOverrideCursor()
-                self.log(f"✗ {s.name}: not readable ({e})")
-                return
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            if s.key not in self.overviews:
+                self.overviews[s.key] = self._overview(s.scene)
+            rgb, z = self.overviews[s.key]
+            glass, outline = self.base_of(s)
+            self._trim()
+        except Exception as e:
             QApplication.restoreOverrideCursor()
-        rgb, z, glass = ov
-        glass = s.result.get("glass", glass) if s.result else glass
-        view.show_section(s.scene, rgb, z, np.asarray(glass, np.float32))
+            self.log(f"✗ {s.shown}: not readable ({e})")
+            return
+        QApplication.restoreOverrideCursor()
         view.set_settings(self.exp.settings_for(s))
+        view.show_section(s.scene, rgb, z, glass, outline)
         self.show_maps(s)
         self._show_label(s)
+        secs = self.exp.sections
+        i = secs.index(s) if s in secs else -1
+        for j in (i + 1, i - 1):
+            if 0 <= j < len(secs) and secs[j].scene is not None:
+                self._ahead.put((secs[j], self.exp.settings_for(secs[j])))
 
     def show_maps(self, s):
         view = self.sections_tab.view
@@ -1201,8 +1671,13 @@ class MainWindow(QMainWindow):
                     self.later(lambda: self._label_ready(path, img))
             threading.Thread(target=work, daemon=True).start()
         pm = self.labels.get(s.path)
-        lab.setPixmap(pm.scaled(240, 120, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-                      if pm is not None else QPixmap())
+        if pm is None:
+            lab.setPixmap(QPixmap())
+            return
+        pm = pm.transformed(QTransform().rotate(self.opts["view"]["label_rotation"]),
+                            Qt.SmoothTransformation)
+        lab.setPixmap(pm.scaled(max(60, lab.width() - 8), max(60, lab.height() - 8),
+                                Qt.KeepAspectRatio, Qt.SmoothTransformation))
 
     def _label_ready(self, path, img):
         self.labels[path] = QPixmap.fromImage(img)
@@ -1240,7 +1715,7 @@ class MainWindow(QMainWindow):
             el = time.perf_counter() - t0
             frac = (i + done / max(total, 1)) / n
             left = el / frac - el if frac > 0.02 else None
-            text = (f"{i + 1} of {n}: {jobs[i][0].name} — {100 * done / max(total, 1):.0f} %"
+            text = (f"{i + 1} of {n}: {jobs[i][0].shown} — {100 * done / max(total, 1):.0f} %"
                     + (f" · ~{left / 60:.0f} min left" if left and left > 90 else
                        f" · ~{left:.0f} s left" if left else ""))
             self.later(lambda: (tab.bar.setValue(int(1000 * frac)), tab.progress.setText(text)))
@@ -1253,7 +1728,7 @@ class MainWindow(QMainWindow):
                     r = analysis.analyze(sc, sst, regions, cancel=cancel,
                                          progress=lambda d, t, i=i: progress(i, len(jobs), d, t))
                 except Exception as e:
-                    self.later(lambda s=s, e=e: self.log(f"✗ {s.name}: {e}"))
+                    self.later(lambda s=s, e=e: self.log(f"✗ {s.shown}: {e}"))
                     continue
                 if not r:
                     break
@@ -1275,7 +1750,7 @@ class MainWindow(QMainWindow):
         s.result, s.maps = r, enc
         self.decoded[(s.key, r["fingerprint"])] = maps
         row = r["rows"][0]
-        self.log(f"✓ {s.name}: {fmt(row['pct'])} % of {row['tissue_mm2']:.2f} mm² stained"
+        self.log(f"✓ {s.shown}: {fmt(row['pct'])} % of {row['tissue_mm2']:.2f} mm² stained"
                  + "".join(f"; {x['region']} {fmt(x['pct'])} %" for x in r["rows"][1:])
                  + f"  ({r['seconds']:g} s)")
         self.changed(view=False)

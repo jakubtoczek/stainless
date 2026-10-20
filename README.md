@@ -34,21 +34,30 @@ into `C:\Users\Public\Stainless` (`STAINLESS_RUNTIME` picks another place).
 **`uninstall.bat`** removes it: the whole private folder, or only Stainless's part of the
 shared one. Python 3.13, not newer: the CZI reader (pylibCZIrw) has no newer build.
 
-What Stainless remembers (the last folder, your region names) is in `stainless_options.json`
-beside `Stainless.bat`; an internal error's details, in `stainless_errors.log` there (send it
-along with a problem report).
+What Stainless remembers (**Options…**, Ctrl+,: the colours, what the side panel starts
+with, the names offered for regions, what Find artefacts looks for, the aliases, the last
+folder) is in `stainless_options.json` beside `Stainless.bat`; an internal error's details,
+in `stainless_errors.log` there (send it along with a problem report).
 
 ## Use
 
 **Drop CZI scans or folders anywhere on the window**, or **Add scans…** (Ctrl+I). Each scene
 of a file is a section. Slide previews and snapshots (coarser than 2 µm/px) are left out,
 with a line in the log. Hover anything for what it does; the log at the bottom says what
-happened and what looks wrong (✗ ⚠).
+happened and what looks wrong (✗ ⚠) — drag the bar above it down to close it. Every bar
+between the parts of the window can be dragged; the sizes are kept.
 
 1. **Sections** — the list on the left, with each section's thumbnail and the slide's label as
-   the scanner photographed it. Give each a *name*, a *group* (what the figure compares) and
-   a *role*: sample, negative control, positive control, or left out. A file named
-   "…neg…" or "…posit…" starts as a control.
+   the scanner photographed it (turned 90°: Options › Sections). Give each a *group* (what
+   the figure compares) and a *role*: sample, negative control, positive control, or left
+   out. A file named "…neg…" or "…posit…" starts as a control. An **alias** is the name a
+   section is shown and reported under (the scan's name stays beside it); **Shorten** gives
+   the selected sections (all, if one is selected) their names without the words they all
+   share — the date, the study, the stain. An alias is remembered and given again when the
+   same scan is added to another experiment.
+
+   The panel on the right is in blocks; click a block's title to fold it (which are folded
+   at start: Options › Side panel).
    - **Stain**: DAB or SA-β-gal.
    - **Stained when**: the rule (below), shared by every section. **Zoom in** (mouse wheel)
      and the view reads the scan in detail and colours, live, what the rule calls stained;
@@ -56,19 +65,40 @@ happened and what looks wrong (✗ ⚠).
      A section stained more strongly, or with more background, can have **its own rule**:
      switch on *this section only*, and the sliders set that section's alone (*Reset* puts
      it back on the shared rule). The list marks it *own rule*; the results give every row's
-     threshold and say *own* or *shared*.
+     threshold and say *own* or *shared*. **more** shows what counts as tissue: a pixel's
+     own OD (with a counterstain) and the OD outlining the section.
    - **Resolution**: the scan's own pixels, ½ (2 × 2 averaged, the default) or ¼.
-   - **Regions**: pick a name, **Draw** (D), and trace around the area with the left button
-     held. Draw as many as needed; each is reported apart, the whole section always. A region
-     named **exclude** takes its area out of the tissue everywhere (folds, debris, bubbles).
-     Click a region to select it; double-click its name in the list to rename; Del removes.
+   - **Regions** are **ROIs** or **exclusions**. Pick one in the list — *ROI*, a name
+     (Options › Regions offers sets of names, e.g. *MI*: infarct, border zone, remote) or
+     *exclude* — and drawing starts (or **Draw**, D; the button stays down while drawing):
+     **click** the corners of a polygon and double-click, press Enter or click the first
+     corner to close it; or **hold the left button and trace**. Backspace takes the last
+     corner back; **right-click** or Esc cancels.
+     ROIs of one name are **one region** (pooled) in the results; without a name each is
+     its own (ROI 1, ROI 2…). An exclusion takes its area out of the tissue everywhere.
+     Click a region (or its name) to select it: its points show. Drag a point to move it;
+     click its line to add one — on a traced outline, grabbing the line puts two points
+     beside it, so the drag bends that stretch only; Del removes the point, or the region
+     when no point was clicked. The exclusions are listed under *excluded*, folded. The
+     square beside a name sets that ROI's colour (every ROI of the name).
+     **Find artefacts** (this section, or all) looks for **tissue folds, bubbles and debris**
+     and adds them as exclusions (*tissue fold 1*, *bubble 1*…; found again: replaced) —
+     tissue absorbing far more than the tissue around it and not toward the stain. Check
+     them: an edited or removed one stays so. What is looked for: Options › Artefacts.
+   - **Show**: what is stained (the measured map; zoomed in, **live** — the button lights up
+     and the slide says *LIVE*), what is not counted as tissue, the ROIs, the exclusions, a
+     scale bar, each with its colour beside it. **White balance** *auto* (on: lit) shows
+     each section's glass white; it changes only what is shown.
    - **Measure**: *This section*, or *All* — every section not measured yet, or measured with
-     other settings or regions (Ctrl+M). Stop keeps what is finished. A section measured with
-     other settings than the current ones says so (in orange in the results).
-2. **Results** — a row per section and region: tissue mm², stained mm², % stained, mean OD of
-   the stained pixels. The figure shows one region: a dot per section, mean ± SD per group,
-   controls apart in grey. **Copy** (Ctrl+C), **Export…** (Ctrl+E: `.xlsx` with the
-   experiment and the settings, or `.csv`), **Save figure…** (PNG, SVG, PDF).
+     other settings or regions (Ctrl+M). Stop keeps what is finished. The table gives the
+     ROIs and the **remaining tissue** (in none of them); **more** adds the whole section,
+     the excluded tissue and how it was measured. A section measured with other settings
+     than the current ones says so (in orange in the results).
+2. **Results** — a row per section and region (the whole section, each ROI, the remaining
+   tissue): tissue mm², stained mm², % stained, mean OD of the stained pixels, the scan. The
+   figure shows one region: a dot per section, mean ± SD per group, controls apart in grey.
+   **Copy** (Ctrl+C), **Export…** (Ctrl+E: `.xlsx` with the experiment and the settings, or
+   `.csv`), **Save figure…** (PNG, SVG, PDF).
 3. **Experiment** — what was done: title, operator, tissue, antibody, dilution, detection,
    chromogen, counterstain…; below, the settings it was measured with and what each scan says
    about itself (scanner, objective, date).
@@ -84,14 +114,21 @@ measured on the slide (the brightest fifth of the scanned area), not against pur
 scanner's glass is grey-green (RGB ≈ 160, 162, 160), and an OD taken against 255 would carry
 that tint into every pixel.
 
-- **Tissue**: summed OD (R + G + B) ≥ 0.15, inside the section's outline (pieces under
-  0.02 mm² are dust), minus the regions named *exclude*.
+- **Tissue**: summed OD (R + G + B) ≥ 0.15, inside the section's outline (OD smoothed over
+  ~16 µm ≥ 0.10; pieces under 0.02 mm² are dust), minus the exclusions. The view, zoomed in,
+  uses the same outline.
 - **Stained**: the absorbance **points toward the stain** — hue score ≥ the threshold — and is
   **dense enough** to be stain — summed OD ≥ the minimum. The hue score is (OD · w) / ΣOD:
   which way the absorbance points, independent of how much there is. For DAB, w = blue − red:
   brown absorbs blue more than red, hematoxylin the other way round, unstained grey tissue
   neither (0). For SA-β-gal, w = red − blue.
-- **% stained** = stained px / tissue px × 100, in the whole section and in each region.
+- **% stained** = stained px / tissue px × 100, in the whole section, in each ROI (ROIs of
+  one name together) and in the remaining tissue (in no ROI).
+- **Artefacts** (found on request, at 4 µm/px): tissue whose OD, smoothed over ~8 µm, is
+  ≥ 1.6 × that of the tissue within ~250 µm and of the section's median, and doesn't point
+  toward the stain. A fold is tissue lying on itself: twice the absorbance, the same colour.
+  A dark ring around a light disc is a bubble; far darker than tissue (OD ≥ 1.2 and ≥ 3 ×
+  the median), debris; else a fold. Tuned by eye on the VCAM-1 MI slides only.
 
 Defaults, each set on real slides:
 - **DAB**: hue ≥ 0.03, summed OD ≥ 0.20, tissue OD ≥ 0.15 — on the VCAM-1 MI slides, the
@@ -128,5 +165,5 @@ python misc/make_icon.py                   # redraw the icon
 ```
 
 `analysis.py` (the measurement, no Qt) · `czi.py` (scenes, reads, label) · `model.py` (the
-experiment, its .json, exports) · `viewer.py` (the slide view) · `plot.py` (the figure) ·
-`app.py` (the window). Version: CalVer `YYYY.M.D`, the date the shipping code last changed.
+experiment, its .json, exports, region editing) · `viewer.py` (the slide view) · `plot.py`
+(the figure) · `options.py` (the options and their window) · `app.py` (the window). Version: CalVer `YYYY.M.D`, the date the shipping code last changed.
