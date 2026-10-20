@@ -21,7 +21,7 @@ RECORD = ["title", "date", "operator", "project", "aim", "tissue", "target / ant
           "clone, supplier, catalog #", "dilution", "detection", "chromogen", "counterstain",
           "comment"]
 HINT = {"title": "what this experiment is", "aim": "the question it answers",
-        "tissue": "mouse heart, 7 d after MI…", "target / antibody": "VCAM-1, rabbit anti-mouse…",
+        "tissue": "mouse heart, 7 d after MI…", "target / antibody": "the target; rabbit anti-mouse, monoclonal…",
         "dilution": "1:200", "detection": "HRP polymer, 30 min…", "chromogen": "DAB, 5 min",
         "counterstain": "hematoxylin"}
 COLUMNS = ["section", "group", "role", "region", "tissue_mm2", "stained_mm2", "pct",
@@ -414,7 +414,7 @@ def summary(rows: list[dict], region: str) -> list[dict]:
 if __name__ == "__main__":
     import json
     import tempfile
-    assert guess_role("061026_IHC-VCAM1_MICID-MI-21 ctrl negatif") == "negative control"
+    assert guess_role("061026_IHC_slide-21 ctrl negatif") == "negative control"
     assert guess_role("x_ctrl_positif") == "positive control" and guess_role("MI-21") == "sample"
     e = Experiment()
     s = Section("C:/nowhere/a.czi", 0, "a s0", group="MI", rule={"threshold": 0.05}, regions=[

@@ -13,10 +13,10 @@ glass's colour into every pixel. A pixel is
 
 The hue score is (OD · w) / ΣOD: which way the absorbance points, independent of how much
 there is. For DAB, w = blue − red: brown absorbs blue more than red, hematoxylin the other
-way, grey tissue neither. On the MI-21 VCAM-1 slide it found 9–11 % of the infarct stained
-where colour deconvolution's DAB channel found 1.3–2.5 %, both at the threshold leaving
-0.5 % of the negative control's infarct positive: deconvolution follows darkness, so the
-control's dark folds and nuclei set its threshold (devlog, 2026-10-19).
+way, grey tissue neither. On the slides it was made on, it found 9–11 % of a stained region
+positive where colour deconvolution's DAB channel found 1.3–2.5 %, both at the threshold
+leaving 0.5 % of the negative control positive: deconvolution follows darkness, so the
+control's dark folds and nuclei set its threshold.
 
 One rule shared by an experiment's sections (a section may be given its own, recorded with
 its result): a control and a treated section are measured with the same ruler.
@@ -37,7 +37,7 @@ import os
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass
 
 import cv2
 import numpy as np
@@ -377,7 +377,7 @@ def artefacts(rgb: np.ndarray, um: float, st: Settings, factor: float = 1.6,
         c = max(cs, key=cv2.contourArea)
         filled, per = cv2.contourArea(c), cv2.arcLength(c, True)
         dark = float(s[y:y + h, x:x + w][lab[y:y + h, x:x + w] == i].mean())
-        # ponytail: shape and darkness rules, looked at on the VCAM-1 slides only
+        # ponytail: shape and darkness rules, looked at on four DAB sections only
         if (filled > 1.8 * stats[i, cv2.CC_STAT_AREA] and
                 4 * np.pi * filled / max(per, 1) ** 2 > 0.6):
             what = "bubble"

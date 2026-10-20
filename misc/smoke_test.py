@@ -7,13 +7,14 @@ never the user's.
 
     .venv/Scripts/python misc/smoke_test.py [CZI] [--shots DIR]
 
-CZI: a scan with two sections, stained (scene 0) and its negative control (scene 1);
-default the MI-21 VCAM-1 slide.
+CZI: a DAB scan with two sections, stained (scene 0, its lower-left quarter strongly) and
+its negative control (scene 1); default $STAINLESS_SMOKE_CZI.
 """
 
 from __future__ import annotations
 
 import json
+import os
 import sys
 import tempfile
 import time
@@ -21,8 +22,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
-DEFAULT = Path(r"U:\LRB\Microscopie_images\Cardio\MICID\081026_IHC anti VCAM1"
-               r"\061026_IHC-VCAM1_MICID-MI-21.czi")
+DEFAULT = os.environ.get("STAINLESS_SMOKE_CZI", "")
 
 
 def main(argv) -> int:
@@ -42,7 +42,9 @@ def main(argv) -> int:
     shots = Path(argv[argv.index("--shots") + 1]) if "--shots" in argv else None
     if shots:
         args = [a for a in args if Path(a) != shots]
-    czi_path = Path(args[0]) if args else DEFAULT
+    czi_path = Path(args[0] if args else DEFAULT)
+    if not czi_path.is_file():
+        raise SystemExit(__doc__)
     out = Path(tempfile.mkdtemp(prefix="stainless_smoke_"))
     qapp.OPTIONS = out / "options.json"
 
@@ -96,7 +98,7 @@ def main(argv) -> int:
         ev(QEvent.MouseButtonPress, fx, fy, button)
         ev(QEvent.MouseButtonRelease, fx, fy, button)
 
-    # an ROI named "infarct", drawn with clicks: the box over the lower-left infarct
+    # an ROI named "infarct", drawn with clicks: a box over the lower-left quarter
     tab.kind.setCurrentText("infarct")
     tab.kind.activated.emit(0)                       # picking a kind starts drawing
     assert tab.draw.isChecked() and view.drawing
@@ -196,6 +198,14 @@ def main(argv) -> int:
     s1 = w.exp.sections[1]
     found = [r for r in s1.regions if r.get("auto")]
     assert found and all(r["kind"] == "exclude" for r in found), s1.regions
+    it = tab.tree.topLevelItem(0).child(0)            # one renamed: the user's now
+    it.setText(0, "my fold")
+    assert not w.exp.sections[1].regions[0].get("auto")
+    tab.find([w.exp.sections[1]])
+    wait(lambda: tab.find_one.isEnabled(), 60)
+    s1 = w.exp.sections[1]
+    assert sum(r["name"] == "my fold" for r in s1.regions) == 1
+    assert len(s1.regions) == len(found), (len(s1.regions), len(found))   # not twice
     print("artefacts on the control:", ", ".join(r["name"] for r in found[:6]),
           "…" if len(found) > 6 else "")
     shot("2b_artefacts")
@@ -250,7 +260,7 @@ def main(argv) -> int:
     assert tab.result.rowCount() == 4                 # + whole section, excluded
     shot("3_measured")
 
-    # the live detail: zoom into the infarct
+    # the live detail: zoom into the box
     view.fitInView(0.17 * sc.w, 0.60 * sc.h, 0.06 * sc.w, 0.04 * sc.h, Qt.KeepAspectRatio)
     view._want_detail()
     wait(lambda: view._detail is not None, 60)
@@ -329,9 +339,9 @@ def main(argv) -> int:
 
     # the record
     w.tabs.setCurrentWidget(w.record_tab)
-    w.record_tab.fields["title"].setText("VCAM-1, MI-21")
+    w.record_tab.fields["title"].setText("smoke test")
     w.record_tab._edit("title")
-    assert w.exp.record["title"] == "VCAM-1, MI-21"
+    assert w.exp.record["title"] == "smoke test"
     shot("6_experiment")
     w.tabs.setCurrentWidget(tab)
 
@@ -370,7 +380,7 @@ def main(argv) -> int:
     e2 = w2.exp
     assert len(e2.sections) == 2 and e2.sections[1].role == "negative control"
     assert e2.state(e2.sections[0]) == "measured", e2.state(e2.sections[0])
-    assert e2.sections[0].maps and e2.record["title"] == "VCAM-1, MI-21"
+    assert e2.sections[0].maps and e2.record["title"] == "smoke test"
     assert e2.sections[0].alias == w.exp.sections[0].alias
     assert any(r.get("auto") for r in e2.sections[1].regions)
     assert not model.crosses(np.asarray(e2.sections[1].regions[-1]["points"], float))

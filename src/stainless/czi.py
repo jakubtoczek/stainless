@@ -11,7 +11,6 @@ from __future__ import annotations
 import re
 import threading
 from dataclasses import dataclass
-from pathlib import Path
 
 import numpy as np
 
@@ -78,15 +77,6 @@ def reader(path: str):
     if path not in d:
         d[path] = pyczi.CziReader(path)
     return d[path]
-
-
-def close_readers() -> None:
-    for r in getattr(_local, "readers", {}).values():
-        try:
-            r.close()
-        except Exception:
-            pass
-    _local.readers = {}
 
 
 def read(scene: Scene, x: int, y: int, w: int, h: int, zoom: float) -> np.ndarray:

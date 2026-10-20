@@ -19,9 +19,8 @@ import traceback
 from dataclasses import asdict, replace
 from pathlib import Path
 
-import numpy as np
-from PySide6.QtCore import QEvent, QLocale, QObject, QSize, Qt, QTimer, Signal
-from PySide6.QtGui import (QAction, QColor, QIcon, QKeySequence, QPainter, QPixmap,
+from PySide6.QtCore import QEvent, QLocale, QObject, QPointF, QSize, Qt, QTimer, Signal
+from PySide6.QtGui import (QAction, QColor, QIcon, QKeySequence, QPainter, QPixmap, QPolygonF,
                            QShortcut, QTransform)
 from PySide6.QtWidgets import (QAbstractItemView, QAbstractScrollArea, QAbstractSpinBox,
                                QApplication, QCheckBox, QComboBox, QDoubleSpinBox,
@@ -414,7 +413,7 @@ class SectionsTab(QWidget):
         b = block("Resolution")
         row, self.res_btns = segmented(RESOLUTIONS, self._resolution)
         tips = ["the scan's own pixels: ~4× slower, and the camera's pixel noise reads as "
-                "stain (the negative control +66 % on MI-21; ×14 on a 10× scan)",
+                "stain (a negative control +66 %; ×14 on a 10× scan)",
                 "2 × 2 scan pixels averaged (the file's own ½ level): the same numbers as the "
                 "scan's pixels smoothed by ~2 px, a quarter of the time. The default",
                 "4 × 4 averaged: 4× faster again; thin stained structures start to fade"]
@@ -544,7 +543,6 @@ class SectionsTab(QWidget):
     # -- options
     def apply_options(self):
         """Colours, the names offered, the view's style: from the options."""
-        o = self.win.opts
         cur = self.kind.currentText()
         self.kind.blockSignals(True)
         self.kind.clear()
@@ -952,6 +950,7 @@ class SectionsTab(QWidget):
         if s is None or not (0 <= i < len(s.regions)):
             return
         self.win.snap()
+        r.pop("auto", None)                          # edited by hand: kept by Find artefacts
         s.regions[i] = model.filled(r)
         if s.regions[i] is not r:                    # dragged across itself: a new outline
             self.view.node = None
@@ -966,6 +965,7 @@ class SectionsTab(QWidget):
         if name and name != s.regions[i]["name"]:
             self.win.snap()
             s.regions[i]["name"] = name
+            s.regions[i].pop("auto", None)
             self.win.changed(view=False, select=i)
 
     def _remove_region(self):
@@ -1013,6 +1013,11 @@ class SectionsTab(QWidget):
         self.win.snap()
         for s, found in out:
             keep = [r for r in s.regions if not r.get("auto")]
+            mine = [QPolygonF([QPointF(*p) for p in r["points"]]) for r in keep
+                    if r["kind"] == "exclude"]
+            found = [(what, pts) for what, pts in found if not any(   # already excluded by hand
+                m.containsPoint(QPolygonF([QPointF(*p) for p in pts]).boundingRect().center(),
+                                Qt.WindingFill) for m in mine)]
             for what, pts in found:
                 keep.append({"name": model.next_name(keep, {"fold": "tissue fold"}.get(what, what)),
                              "kind": "exclude", "auto": True, "points": pts, "nodes": []})
