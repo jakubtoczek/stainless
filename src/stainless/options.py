@@ -27,6 +27,13 @@ PANEL = ["Stain", "Stained when", "Resolution", "Regions", "Show", "Measure"]
 SHOW = {"stained": "stained", "tissue": "not counted as tissue", "roi": "ROIs",
         "excluded": "excluded regions", "scalebar": "scale bar", "wb": "white balance (auto)"}
 ARTEFACTS = {"fold": "tissue folds", "bubble": "bubbles", "debris": "debris"}
+TABLE = {"alias": "alias", "name": "scan's name", "group": "group", "role": "role",
+         "note": "note", "state": "state", "pct": "% stained", "tissue": "tissue mm²",
+         "regions": "by region", "rois": "ROIs", "excluded": "excluded", "rule": "rule",
+         "px": "µm/px", "size": "size (mm)", "file": "file", "folder": "folder"}
+LINES = {"roi": "ROIs", "excluded": "excluded regions", "selected": "the selected region",
+         "trace": "being drawn"}
+STYLES = ("solid", "dash", "dot", "dash-dot")
 DEFAULTS = {
     "last_dir": "",
     "panel": {"collapsed": {k: k == "Resolution" for k in PANEL},
@@ -37,18 +44,23 @@ DEFAULTS = {
     "regions": {"preset": "", "presets": {"MI": ["infarct", "border zone", "remote"]}},
     "artefacts": {"factor": 1.6, "min_mm2": 0.004, "fold": True, "bubble": True,
                   "debris": True},
-    "colours": {"stained_dab": "#00e676", "stained_sabg": "#ff40a0", "tissue": "#8b0000",
-                "excluded": "#ff4d4d", "scalebar": "#ffffff"},
+    "colours": {"stained_dab": "#00e676", "stained_sabg": "#ff40a0",       # or #AARRGGBB
+                "tissue": "#968b0000", "excluded": "#ff4d4d", "scalebar": "#ffffff"},
+    "lines": {"roi": {"style": "solid", "width": 2, "fill": 9},     # fill: % opacity
+              "excluded": {"style": "dash", "width": 2, "fill": 9},
+              "selected": {"style": "solid", "width": 3, "colour": "#ffffff", "fill": 18},
+              "trace": {"style": "solid", "width": 2, "colour": "#ffffff"}},
     "region_colours": {},                      # an ROI's name -> its colour
     "view": {"white": 245, "badge": True, "bar_pos": "bottom right", "bar_um": 0,
              "excl_as_tissue": False, "label_rotation": 90},
-    "aliases": {},                             # a scan's name -> the alias it was given
+    "table": {k: k not in ("note", "rule", "size", "folder") for k in TABLE},
     "sizes": {"regions": 120, "measure": 130, "main": [], "log": [], "left": []},
 }
-FREE = ("presets", "region_colours", "aliases")     # dicts of the user's own keys
+FREE = ("presets", "region_colours")       # dicts of the user's own keys
 CHOICES = {("new", "profile"): ("dab", "sabg"), ("new", "level"): (0, 1, 2),
            ("view", "bar_pos"): ("bottom right", "bottom left"),
-           ("view", "label_rotation"): (0, 90, 180, 270)}
+           ("view", "label_rotation"): (0, 90, 180, 270),
+           **{("lines", k, "style"): STYLES for k in LINES}}
 
 
 def _merge(default, got, key=""):
@@ -72,15 +84,20 @@ def load(path: Path | None = None, got=None) -> dict:
         except (OSError, ValueError):
             got = {}
     o = _merge(DEFAULTS, got if isinstance(got, dict) else {})
-    for (a, b), ok in CHOICES.items():
-        if o[a][b] not in ok:
-            o[a][b] = DEFAULTS[a][b]
+    for path, ok in CHOICES.items():
+        d, dd = o, DEFAULTS
+        for k in path[:-1]:
+            d, dd = d[k], dd[k]
+        if d[path[-1]] not in ok:
+            d[path[-1]] = dd[path[-1]]
+    for k, v in o["colours"].items():           # #RRGGBB from before alpha: the default's
+        if len(v) == 7 and len(DEFAULTS["colours"][k]) == 9:
+            o["colours"][k] = DEFAULTS["colours"][k][:3] + v[1:]
     o["regions"]["presets"] = {k: [str(n) for n in v if str(n).strip()]
                                for k, v in o["regions"]["presets"].items() if isinstance(v, list)}
     if o["regions"]["preset"] not in o["regions"]["presets"]:
         o["regions"]["preset"] = ""
-    for k in ("region_colours", "aliases"):
-        o[k] = {n: v for n, v in o[k].items() if isinstance(v, str)}
+    o["region_colours"] = {n: v for n, v in o["region_colours"].items() if isinstance(v, str)}
     return o
 
 
@@ -100,8 +117,21 @@ def _left(w: QWidget) -> QHBoxLayout:
     return h
 
 
+def hexa(c: QColor) -> str:
+    """#RRGGBB, or #AARRGGBB when not opaque."""
+    return c.name(QColor.HexArgb if c.alpha() < 255 else QColor.HexRgb)
+
+
+def raise_window(w: QWidget) -> None:
+    """Shown, in front, and back from the taskbar if it was minimized."""
+    w.setWindowState(w.windowState() & ~Qt.WindowMinimized | Qt.WindowActive)
+    w.show()
+    w.raise_()
+    w.activateWindow()
+
+
 class ColorButton(QPushButton):
-    """A colour swatch; a click picks another."""
+    """A colour swatch; a click picks another, and how opaque it is (alpha)."""
     picked = Signal(str)
 
     def __init__(self, colour: str, tip: str = "", size=(28, 16)):
@@ -114,14 +144,16 @@ class ColorButton(QPushButton):
 
     def set(self, colour: str):
         self.colour = colour
-        self.setStyleSheet(f"QPushButton{{background:{colour}; border:1px solid #6a6a6a; "
-                           f"border-radius:3px;}}")
+        r, g, b, a = QColor(colour).getRgb()
+        self.setStyleSheet(f"QPushButton{{background:rgba({r},{g},{b},{a}); "
+                           f"border:1px solid #6a6a6a; border-radius:3px;}}")
 
     def _pick(self):
-        c = QColorDialog.getColor(QColor(self.colour), self, "Colour")
+        c = QColorDialog.getColor(QColor(self.colour), self, "Colour",
+                                  QColorDialog.ShowAlphaChannel)
         if c.isValid():
-            self.set(c.name())
-            self.picked.emit(c.name())
+            self.set(hexa(c))
+            self.picked.emit(hexa(c))
 
 
 class OptionsWindow(QMainWindow):
@@ -167,9 +199,7 @@ class OptionsWindow(QMainWindow):
             hit = self.topics.findItems(topic, Qt.MatchExactly)
             if hit:
                 self.topics.setCurrentItem(hit[0])
-        self.show()
-        self.raise_()
-        self.activateWindow()
+        raise_window(self)
 
     def _set(self, path: tuple, value) -> None:
         """One option changed: saved, and the window follows."""
@@ -194,7 +224,7 @@ class OptionsWindow(QMainWindow):
                            ("Regions", self._regions_page()),
                            ("Artefacts", self._artefacts_page()),
                            ("View", self._view_page()),
-                           ("Colours", self._colours_page()),
+                           ("Colours & lines", self._colours_page()),
                            ("Sections", self._sections_page())):
             self.topics.addItem(name)
             sc = QScrollArea(widgetResizable=True)
@@ -234,10 +264,14 @@ class OptionsWindow(QMainWindow):
             v.form.addRow(h)
         return v.form
 
-    def _tick(self, path, text, tip=""):
+    def _get(self, path):
         d = self.o
         for k in path:
-            d = d[k] if isinstance(d, dict) else d
+            d = d[k]
+        return d
+
+    def _tick(self, path, text, tip=""):
+        d = self._get(path)
         c = QCheckBox(text, toolTip=tip)
         c.setChecked(bool(d))
         c.toggled.connect(lambda on: self._set(path, on))
@@ -247,13 +281,13 @@ class OptionsWindow(QMainWindow):
         c = QComboBox()
         for val, text in items:
             c.addItem(text, val)
-        c.setCurrentIndex(max(0, c.findData(self.o[path[0]][path[1]])))
+        c.setCurrentIndex(max(0, c.findData(self._get(path))))
         c.activated.connect(lambda i: self._set(path, c.itemData(i)))
         c.setFixedWidth(240)
         return c
 
     def _number(self, path, lo, hi, step, suffix="", decimals=None, special=""):
-        val = self.o[path[0]][path[1]]
+        val = self._get(path)
         s = QSpinBox() if isinstance(val, int) else QDoubleSpinBox(decimals=decimals or 3)
         s.setRange(lo, hi)
         s.setSingleStep(step)
@@ -267,7 +301,7 @@ class OptionsWindow(QMainWindow):
         return s
 
     def _colour(self, path, tip=""):
-        b = ColorButton(self.o[path[0]][path[1]], tip)
+        b = ColorButton(self._get(path), tip)
         b.picked.connect(lambda c: self._set(path, c))
         return b
 
@@ -392,13 +426,40 @@ class OptionsWindow(QMainWindow):
         return w
 
     def _colours_page(self):
-        w, v = self._page("Colours", "The overlays' colours. An ROI's colour is set beside "
-                          "it in the Regions list, and remembered by its name.")
+        w, v = self._page("Colours & lines", "The overlays' colours, each with how opaque it "
+                          "is (alpha, in the colour window). An ROI's colour is set beside it "
+                          "in the Regions list, and remembered by its name.")
         f = self._form(v)
         for k, text in (("stained_dab", "stained, DAB"), ("stained_sabg", "stained, SA-β-gal"),
                         ("tissue", "not counted as tissue"), ("excluded", "excluded regions"),
                         ("scalebar", "scale bar")):
             f.addRow(text, self._colour(("colours", k)))
+        f = self._form(v, "Lines: style, width, colour, fill")
+        for k, text in LINES.items():
+            row = QHBoxLayout()
+            st = self._choice(("lines", k, "style"), [(s, s) for s in STYLES])
+            st.setFixedWidth(90)
+            row.addWidget(st)
+            wd = self._number(("lines", k, "width"), 1, 12, 1, " px")
+            wd.setFixedWidth(70)
+            row.addWidget(wd)
+            cell = QWidget(fixedWidth=110)          # the colour, or where it comes from
+            ch = QHBoxLayout(cell)
+            ch.setContentsMargins(8, 0, 8, 0)
+            if "colour" in self.o["lines"][k]:
+                ch.addWidget(self._colour(("lines", k, "colour")))
+            else:
+                lab = QLabel("by its name" if k == "roi" else "as above")
+                lab.setStyleSheet(GREY)
+                ch.addWidget(lab)
+            ch.addStretch()
+            row.addWidget(cell)
+            if "fill" in self.o["lines"][k]:
+                fl = self._number(("lines", k, "fill"), 0, 100, 5, " % fill")
+                fl.setFixedWidth(95)
+                row.addWidget(fl)
+            row.addStretch()
+            f.addRow(text, row)
         names = self.o["region_colours"]
         if names:
             f = self._form(v, "ROIs")
@@ -418,29 +479,16 @@ class OptionsWindow(QMainWindow):
         return w
 
     def _sections_page(self):
-        w, v = self._page("Sections", "The slide label, and the aliases: the names a "
-                          "section is shown and reported under. An alias is remembered by "
-                          "the scan's name, and given again when that scan is added to "
-                          "another experiment.")
+        w, v = self._page("Sections", "The slide label, and the sections window (Table… "
+                          "above the list, Ctrl+L): a row per section, its alias and what is "
+                          "known of it. Right-click its header to show or hide a column "
+                          "meanwhile.")
         f = self._form(v)
         f.addRow("slide label, turned", self._choice(("view", "label_rotation"), [
             (0, "not turned"), (90, "90° clockwise"), (180, "180°"), (270, "90° anticlockwise")]))
-        al = self.o["aliases"]
-        f = self._form(v, f"Aliases remembered ({len(al)})")
-        t = QTableWidget(len(al), 2)
-        t.setHorizontalHeaderLabels(["scan's name", "alias"])
-        t.verticalHeader().hide()
-        t.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        t.setEditTriggers(QTableWidget.NoEditTriggers)
-        t.setMinimumHeight(200)
-        for i, (k, a) in enumerate(sorted(al.items())):
-            t.setItem(i, 0, QTableWidgetItem(k))
-            t.setItem(i, 1, QTableWidgetItem(a))
-        f.addRow(t)
-        forget = QPushButton("Forget them")
-        forget.clicked.connect(lambda: (self.o["aliases"].clear(), self.main.save_options(),
-                                        self._build()))
-        f.addRow(_left(forget))
+        f = self._form(v, "Sections window: columns shown at start")
+        for k, text in TABLE.items():
+            f.addRow(text, self._tick(("table", k), "shown"))
         v.addStretch()
         return w
 
@@ -471,10 +519,16 @@ class OptionsWindow(QMainWindow):
 
 if __name__ == "__main__":
     o = load(got={"view": {"white": 250.0, "bar_pos": "top"}, "regions": {"preset": "x"},
-                  "aliases": {"a s0": "A", "b": 3}, "region_names": ["infarct"]})
+                  "aliases": {"a s0": "A"}, "region_names": ["infarct"],
+                  "colours": {"tissue": "#123456", "excluded": "#80ff0000"},
+                  "lines": {"roi": {"style": "wavy", "width": 4}}})
     assert o["view"]["white"] == 250 and isinstance(o["view"]["white"], int)
     assert o["view"]["bar_pos"] == "bottom right"            # not a choice: the default
     assert o["regions"]["preset"] == "" and "MI" in o["regions"]["presets"]
-    assert o["aliases"] == {"a s0": "A"} and "region_names" not in o
+    assert "aliases" not in o and "region_names" not in o    # per experiment, now
+    assert o["colours"]["tissue"] == "#96123456" and o["colours"]["excluded"] == "#80ff0000"
+    assert o["lines"]["roi"] == {"style": "solid", "width": 4, "fill": 9}
+    assert o["table"]["alias"] and not o["table"]["folder"]
+    assert hexa(QColor("#80ff0000")) == "#80ff0000" and hexa(QColor("#ff0000")) == "#ff0000"
     assert load(got=[1, 2]) == load(got={})
     print("options self-check OK")

@@ -27,13 +27,13 @@ from PySide6.QtWidgets import (QAbstractItemView, QAbstractScrollArea, QAbstract
                                QApplication, QCheckBox, QComboBox, QDoubleSpinBox,
                                QFileDialog, QFormLayout, QFrame, QHBoxLayout, QHeaderView,
                                QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow,
-                               QMessageBox, QPlainTextEdit, QProgressBar, QPushButton,
+                               QMenu, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton,
                                QScrollArea, QSizePolicy, QSlider, QSplitter, QTableWidget,
                                QTableWidgetItem, QTabWidget, QTreeWidget, QTreeWidgetItem,
                                QVBoxLayout, QWidget)
 
 from . import __version__, analysis, czi, model, options
-from .options import ColorButton
+from .options import ColorButton, hexa, raise_window
 from .viewer import (REGION_COLOURS, SlideView, default_colour, display, level_for,
                      to_qimage, wb_lut)
 
@@ -281,8 +281,8 @@ class SectionsTab(QWidget):
         self.list.setStyleSheet("QListWidget::item{padding:3px;}")
         self.list.currentRowChanged.connect(self._selected)
         self.alias = QLineEdit()
-        self.alias.setToolTip("what this section is shown and reported as; empty: the "
-                              "scan's name. Remembered for this scan")
+        self.alias.setToolTip("what this section is shown and reported as in this "
+                              "experiment; empty: the scan's name")
         self.alias.editingFinished.connect(self._alias)
         shorten = QPushButton("Shorten", clicked=self.shorten,
                               toolTip="an alias for the selected sections (all, if one is "
@@ -315,10 +315,13 @@ class SectionsTab(QWidget):
         add = QPushButton("Add scans…", clicked=win.add_dialog, toolTip="CZI files (Ctrl+I)")
         rem = QPushButton("Remove", clicked=self.remove,
                           toolTip="take the selected sections out of the experiment (Del)")
+        table = QPushButton("Table…", clicked=win.show_table,
+                            toolTip="every section in a window of its own: alias, scan, group, "
+                                    "role, state, results… (Ctrl+L)")
         top = QWidget()
         tv = QVBoxLayout(top)
         tv.setContentsMargins(0, 0, 0, 0)
-        tv.addLayout(hbox(add, rem))
+        tv.addLayout(hbox(add, rem, table))
         tv.addWidget(self.list, 1)
         bottom = QWidget()
         bv = QVBoxLayout(bottom)
@@ -724,7 +727,7 @@ class SectionsTab(QWidget):
                 else:
                     self.tree.addTopLevelItem(it)
                     it.setForeground(0, self.win.roi_colour(r["name"]))
-                    c = ColorButton(self.win.roi_colour(r["name"]).name(), size=(22, 14),
+                    c = ColorButton(hexa(self.win.roi_colour(r["name"])), size=(22, 14),
                                     tip=f"the colour of every ROI named {r['name']}")
                     c.picked.connect(lambda col, n=r["name"]: self._roi_colour(n, col))
                     self.tree.setItemWidget(it, 1, c)
@@ -803,28 +806,24 @@ class SectionsTab(QWidget):
         if self._busy or s is None or text == s.alias:
             return
         self.win.snap()
-        self._set_aliases({s.name: text}, [s])
-
-    def _set_aliases(self, by_name: dict, secs):
-        al = self.win.opts["aliases"]
-        for s in secs:
-            s.alias = by_name[s.name]
-            if s.alias:
-                al[s.name] = s.alias
-            else:
-                al.pop(s.name, None)
-        self.win.save_options()
+        s.alias = text
         self.win.changed()
 
-    def shorten(self):
-        rows = self._rows()
-        secs = [self.win.exp.sections[i] for i in rows] if len(rows) > 1 else self.win.exp.sections
+    def shorten(self, secs=None):
+        """Aliases for *secs* (the selected sections; all, if one is selected): their names
+        without the words they all share."""
+        if secs is None:
+            rows = self._rows()
+            secs = ([self.win.exp.sections[i] for i in rows] if len(rows) > 1
+                    else self.win.exp.sections)
         if len(secs) < 2:
             self.win.log("Shorten: needs two sections at least, to see what their names share")
             return
         self.win.snap()
         short = model.short_names([s.name for s in secs])
-        self._set_aliases({s.name: a for s, a in zip(secs, short)}, secs)
+        for s, a in zip(secs, short):
+            s.alias = a
+        self.win.changed()
         self.win.log(f"✓ {len(secs)} aliases: " + ", ".join(short[:4]) + (" …" if len(secs) > 4 else ""))
 
     def _rows(self) -> list[int]:
@@ -931,7 +930,7 @@ class SectionsTab(QWidget):
         if nodes is not None:
             r["nodes"] = nodes
         self.win.snap()
-        s.regions.append(r)
+        s.regions.append(model.filled(r))            # crossing itself: no hole
         self.draw.setChecked(False)
         self.win.changed(view=False, select=len(s.regions) - 1)
 
@@ -953,7 +952,9 @@ class SectionsTab(QWidget):
         if s is None or not (0 <= i < len(s.regions)):
             return
         self.win.snap()
-        s.regions[i] = r
+        s.regions[i] = model.filled(r)
+        if s.regions[i] is not r:                    # dragged across itself: a new outline
+            self.view.node = None
         self.win.changed(view=False, select=i)
 
     def _region_renamed(self, it, _col):
@@ -1021,6 +1022,144 @@ class SectionsTab(QWidget):
                                                        for k, v in n.items() if v)
                                              or "nothing found") + " — excluded")
         self.win.changed(view=False)
+
+
+# --- the sections window -----------------------------------------------------------------
+
+class SectionsWindow(QMainWindow):
+    """Every section in a row: its alias, the scan, the group, the role, its state and
+    results. Alias, group and note are edited in place; a click on a row shows that
+    section. Right-click the header: the columns shown (at start: Options › Sections)."""
+    EDIT = ("alias", "group", "note")
+
+    def __init__(self, win):
+        super().__init__(win)
+        self.win = win
+        self.setWindowTitle(f"{APP_NAME} — sections")
+        self.resize(1150, 440)
+        self.keys = list(options.TABLE)
+        self.t = QTableWidget(0, len(self.keys))
+        self.t.setHorizontalHeaderLabels(list(options.TABLE.values()))
+        self.t.verticalHeader().hide()
+        self.t.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.t.setEditTriggers(QAbstractItemView.DoubleClicked | QAbstractItemView.EditKeyPressed)
+        self.t.horizontalHeader().setSortIndicator(-1, Qt.AscendingOrder)   # the list's order
+        self.t.setSortingEnabled(True)
+        self.t.itemChanged.connect(self._edited)
+        self.t.currentCellChanged.connect(self._go)
+        h = self.t.horizontalHeader()
+        h.setContextMenuPolicy(Qt.CustomContextMenu)
+        h.customContextMenuRequested.connect(self._columns)
+        for j, k in enumerate(self.keys):
+            self.t.setColumnHidden(j, not win.opts["table"][k])
+        shorten = QPushButton("Shorten", clicked=lambda: win.sections_tab.shorten(self._picked()),
+                              toolTip="aliases for the selected rows (all, if one is selected): "
+                                      "their names without the words they all share")
+        shorten.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        root = QWidget()
+        v = QVBoxLayout(root)
+        v.addLayout(hbox(shorten, dim("Double-click an alias, a group or a note to change it. "
+                                      "Right-click the header: the columns shown."),
+                         stretch_at=2))
+        v.addWidget(self.t, 1)
+        self.setCentralWidget(root)
+        QShortcut(QKeySequence.Copy, self.t, activated=self.copy)
+        self._busy = False
+
+    def open(self):
+        raise_window(self)
+        self.refresh()
+
+    def _values(self, s: model.Section) -> dict:
+        sc = s.scene
+        rows = s.result.get("rows", []) if s.result else []
+        whole = rows[0] if rows else {}
+        return {"alias": s.alias, "name": s.name, "group": s.group, "role": s.role,
+                "note": s.note, "state": self.win.exp.state(s), "pct": whole.get("pct"),
+                "tissue": whole.get("tissue_mm2"),
+                "regions": " · ".join(f"{r['region']} {fmt(r['pct'])} %" for r in rows[1:]),
+                "rois": sum(r["kind"] == "roi" for r in s.regions),
+                "excluded": sum(r["kind"] == "exclude" for r in s.regions),
+                "rule": "own" if s.rule else "shared", "px": sc.px_um if sc else None,
+                "size": f"{sc.w * sc.px_um / 1000:.1f} × {sc.h * sc.px_um / 1000:.1f}"
+                        if sc else "–",
+                "file": s.scan, "folder": str(Path(s.path).parent)}
+
+    def refresh(self):
+        if not self.isVisible():
+            return
+        secs = self.win.exp.sections
+        self._busy = True
+        self.t.setSortingEnabled(False)
+        self.t.setRowCount(len(secs))
+        for i, s in enumerate(secs):
+            for j, (k, v) in enumerate(self._values(s).items()):
+                it = QTableWidgetItem()
+                if isinstance(v, (int, float)):
+                    it.setData(Qt.DisplayRole, round(v, 3) if isinstance(v, float) else v)
+                    it.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                else:
+                    it.setText("–" if v is None else str(v))
+                if k == "alias":
+                    it.setToolTip(f"empty: shown as {s.name}")
+                if k not in self.EDIT:
+                    it.setFlags(it.flags() & ~Qt.ItemIsEditable)
+                if k == "state" and v != "measured":
+                    it.setForeground(QColor("#d9a441"))
+                it.setData(Qt.UserRole, i)
+                self.t.setItem(i, j, it)
+        self.t.setSortingEnabled(True)
+        self.t.resizeColumnsToContents()
+        self._busy = False
+
+    def _section(self, row):
+        it = self.t.item(row, 0)
+        secs = self.win.exp.sections
+        i = it.data(Qt.UserRole) if it is not None else -1
+        return i if 0 <= i < len(secs) else -1
+
+    def _picked(self):
+        rows = sorted({ix.row() for ix in self.t.selectionModel().selectedRows()})
+        secs = [self.win.exp.sections[i] for i in map(self._section, rows) if i >= 0]
+        return secs if len(secs) > 1 else self.win.exp.sections
+
+    def _go(self, row, *_):
+        i = self._section(row)
+        if not self._busy and i >= 0:
+            self.win.sections_tab.list.setCurrentRow(i)
+
+    def _edited(self, it):
+        if self._busy:
+            return
+        k = self.keys[it.column()]
+        i = it.data(Qt.UserRole)
+        secs = self.win.exp.sections
+        text = it.text().strip()
+        if k not in self.EDIT or not (0 <= i < len(secs)) or getattr(secs[i], k) == text:
+            return
+
+        def apply():                      # after the edit: the table is rebuilt
+            self.win.snap()
+            setattr(secs[i], k, text)
+            self.win.changed()
+        QTimer.singleShot(0, apply)
+
+    def _columns(self, pos):
+        m = QMenu(self)
+        for j, k in enumerate(self.keys):
+            a = m.addAction(options.TABLE[k])
+            a.setCheckable(True)
+            a.setChecked(not self.t.isColumnHidden(j))
+            a.toggled.connect(lambda on, j=j: self.t.setColumnHidden(j, not on))
+        m.exec(self.t.horizontalHeader().mapToGlobal(pos))
+
+    def copy(self):
+        cols = [j for j in range(len(self.keys)) if not self.t.isColumnHidden(j)]
+        lines = ["\t".join(options.TABLE[self.keys[j]] for j in cols)]
+        for i in range(self.t.rowCount()):
+            lines.append("\t".join(self.t.item(i, j).text() for j in cols))
+        QApplication.clipboard().setText("\n".join(lines))
+        self.win.log(f"✓ {self.t.rowCount()} sections copied")
 
 
 # --- Results tab -------------------------------------------------------------------------
@@ -1232,7 +1371,7 @@ class MainWindow(QMainWindow):
         self._cancel = None
         self._ahead: queue.Queue = queue.Queue()
         threading.Thread(target=self._read_ahead, daemon=True).start()
-        self.options_window = None
+        self.options_window = self.table_window = None
         self.resize(1500, 920)
         self.setAcceptDrops(True)
 
@@ -1259,8 +1398,8 @@ class MainWindow(QMainWindow):
                 (None, None, None, None),
                 ("Export results…", "Ctrl+E", ".xlsx or .csv", self.export_dialog),
                 (None, None, None, None),
-                ("Options…", "Ctrl+,", "colours, what the panel starts with, names offered "
-                                       "for regions, artefacts, aliases…", self.show_options)]:
+                ("Options…", "Ctrl+,", "colours and lines, what the panel starts with, names "
+                                       "offered for regions, artefacts…", self.show_options)]:
             if text is None:
                 bar.addSeparator()
                 continue
@@ -1269,7 +1408,8 @@ class MainWindow(QMainWindow):
             bar.addAction(a)
         for key, fn in ((QKeySequence.Undo, self.do_undo), (QKeySequence.Redo, self.do_redo),
                         (QKeySequence("Ctrl+Shift+Z"), self.do_redo),
-                        (QKeySequence("Ctrl+I"), self.add_dialog)):
+                        (QKeySequence("Ctrl+I"), self.add_dialog),
+                        (QKeySequence("Ctrl+L"), self.show_table)):
             self.addAction(QAction(self, shortcut=key, triggered=fn))
 
         self.vsplit = QSplitter(Qt.Vertical)
@@ -1314,11 +1454,11 @@ class MainWindow(QMainWindow):
 
     def view_style(self) -> dict:
         v = self.opts["view"]
-        return {"stained": QColor(self.colour("stained")).getRgb()[:3],
+        return {"stained": self.colour("stained"),
                 "tissue": self.colour("tissue"), "excluded": self.colour("excluded"),
                 "scalebar": self.colour("scalebar"), "white": v["white"], "badge": v["badge"],
                 "bar_pos": v["bar_pos"], "bar_um": v["bar_um"],
-                "excl_as_tissue": v["excl_as_tissue"]}
+                "excl_as_tissue": v["excl_as_tissue"], "lines": self.opts["lines"]}
 
     def apply_options(self, topic):
         """An option changed (*topic*: its key, None: all): the window follows."""
@@ -1330,6 +1470,11 @@ class MainWindow(QMainWindow):
         if self.options_window is None:
             self.options_window = options.OptionsWindow(self)
         self.options_window.open()
+
+    def show_table(self):
+        if self.table_window is None:
+            self.table_window = SectionsWindow(self)
+        self.table_window.open()
 
     # -- bookkeeping
     def _error(self, kind, err, tb):
@@ -1411,10 +1556,14 @@ class MainWindow(QMainWindow):
             st.fill_regions(st._region_index() if select is None else select)
             self.show_maps(st.current())
             self._refresh_tab()
+            if self.table_window is not None:
+                self.table_window.refresh()
 
     def refresh_all(self):
         self.sections_tab.refresh()
         self._refresh_tab()
+        if self.table_window is not None:
+            self.table_window.refresh()
 
     def _refresh_tab(self):
         w = self.tabs.currentWidget()
@@ -1447,7 +1596,7 @@ class MainWindow(QMainWindow):
         QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
             self.snap()
-            new, notes = self.exp.add(paths, self.opts["aliases"])
+            new, notes = self.exp.add(paths)
         finally:
             QApplication.restoreOverrideCursor()
         self.log(*[f"⚠ {n}" for n in notes])

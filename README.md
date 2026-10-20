@@ -34,9 +34,9 @@ into `C:\Users\Public\Stainless` (`STAINLESS_RUNTIME` picks another place).
 **`uninstall.bat`** removes it: the whole private folder, or only Stainless's part of the
 shared one. Python 3.13, not newer: the CZI reader (pylibCZIrw) has no newer build.
 
-What Stainless remembers (**Options…**, Ctrl+,: the colours, what the side panel starts
-with, the names offered for regions, what Find artefacts looks for, the aliases, the last
-folder) is in `stainless_options.json` beside `Stainless.bat`; an internal error's details,
+What Stainless remembers (**Options…**, Ctrl+,: the colours and lines, what the side panel
+starts with, the names offered for regions, what Find artefacts looks for, the columns of
+the sections window, the last folder) is in `stainless_options.json` beside `Stainless.bat`; an internal error's details,
 in `stainless_errors.log` there (send it along with a problem report).
 
 ## Use
@@ -53,8 +53,13 @@ between the parts of the window can be dragged; the sizes are kept.
    out. A file named "…neg…" or "…posit…" starts as a control. An **alias** is the name a
    section is shown and reported under (the scan's name stays beside it); **Shorten** gives
    the selected sections (all, if one is selected) their names without the words they all
-   share — the date, the study, the stain. An alias is remembered and given again when the
-   same scan is added to another experiment.
+   share — the date, the study, the stain. Aliases belong to the experiment.
+   **Table…** (Ctrl+L) opens the sections in a window of their own, a row each: alias, the
+   scan's name, group, role, note, state, % stained, tissue, each region's %, the number of
+   ROIs and exclusions, µm/px, size, file, folder. Alias, group and note are edited there
+   (double-click); a click on a row shows that section; Ctrl+C copies the table.
+   Right-click its header to show or hide columns; which are shown at start: Options ›
+   Sections.
 
    The panel on the right is in blocks; click a block's title to fold it (which are folded
    at start: Options › Side panel).
@@ -73,21 +78,23 @@ between the parts of the window can be dragged; the sizes are kept.
      *exclude* — and drawing starts (or **Draw**, D; the button stays down while drawing):
      **click** the corners of a polygon and double-click, press Enter or click the first
      corner to close it; or **hold the left button and trace**. Backspace takes the last
-     corner back; **right-click** or Esc cancels.
+     corner back; **right-click** or Esc cancels. An outline that crosses itself becomes
+     the outline around all it encloses: no hole where it crossed.
      ROIs of one name are **one region** (pooled) in the results; without a name each is
      its own (ROI 1, ROI 2…). An exclusion takes its area out of the tissue everywhere.
      Click a region (or its name) to select it: its points show. Drag a point to move it;
      click its line to add one — on a traced outline, grabbing the line puts two points
      beside it, so the drag bends that stretch only; Del removes the point, or the region
      when no point was clicked. The exclusions are listed under *excluded*, folded. The
-     square beside a name sets that ROI's colour (every ROI of the name).
+     square beside a name sets that ROI's colour (every ROI of the name) and how opaque it
+     is (alpha). The lines' style, width and fill: Options › Colours & lines.
      **Find artefacts** (this section, or all) looks for **tissue folds, bubbles and debris**
      and adds them as exclusions (*tissue fold 1*, *bubble 1*…; found again: replaced) —
      tissue absorbing far more than the tissue around it and not toward the stain. Check
      them: an edited or removed one stays so. What is looked for: Options › Artefacts.
    - **Show**: what is stained (the measured map; zoomed in, **live** — the button lights up
      and the slide says *LIVE*), what is not counted as tissue, the ROIs, the exclusions, a
-     scale bar, each with its colour beside it. **White balance** *auto* (on: lit) shows
+     scale bar, each with its colour (and alpha) beside it. **White balance** *auto* (on: lit) shows
      each section's glass white; it changes only what is shown.
    - **Measure**: *This section*, or *All* — every section not measured yet, or measured with
      other settings or regions (Ctrl+M). Stop keeps what is finished. The table gives the
@@ -115,8 +122,8 @@ scanner's glass is grey-green (RGB ≈ 160, 162, 160), and an OD taken against 2
 that tint into every pixel.
 
 - **Tissue**: summed OD (R + G + B) ≥ 0.15, inside the section's outline (OD smoothed over
-  ~16 µm ≥ 0.10; pieces under 0.02 mm² are dust), minus the exclusions. The view, zoomed in,
-  uses the same outline.
+  ~16 µm ≥ 0.10; pieces under 0.02 mm² are dust), minus the exclusions (where two overlap,
+  their union). The view, zoomed in, uses the same outline.
 - **Stained**: the absorbance **points toward the stain** — hue score ≥ the threshold — and is
   **dense enough** to be stain — summed OD ≥ the minimum. The hue score is (OD · w) / ΣOD:
   which way the absorbance points, independent of how much there is. For DAB, w = blue − red:

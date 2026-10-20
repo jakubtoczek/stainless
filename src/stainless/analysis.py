@@ -44,7 +44,7 @@ import numpy as np
 
 from . import czi
 
-ALGORITHM = 2             # bump when a change alters numbers: old results show as stale
+ALGORITHM = 3             # bump when a change alters numbers: old results show as stale
 OUTLINE_UM = 8.0          # resolution of the section outline and of the stored maps
 ARTEFACT_UM = 4.0         # resolution folds, bubbles and debris are looked for at
 MIN_PIECE_MM2 = 0.02      # tissue pieces smaller than this are dust
@@ -161,12 +161,13 @@ def kind(r: dict) -> str:
 
 
 def rasterize(polys, shape, ox, oy, scale) -> np.ndarray:
-    """Polygons (full-res scene px) filled into a 255/0 array covering (ox, oy) at *scale*."""
+    """Polygons (full-res scene px) filled into a 255/0 array covering (ox, oy) at *scale*:
+    their union (filled together, two that overlap would cancel out where they do)."""
     m = np.zeros(shape, np.uint8)
-    pts = [np.round((np.asarray(p, np.float64) - (ox, oy)) * scale).astype(np.int32)
-           for p in polys if len(p) >= 3]
-    if pts:
-        cv2.fillPoly(m, pts, 255)
+    for p in polys:
+        if len(p) >= 3:
+            cv2.fillPoly(m, [np.round((np.asarray(p, np.float64) - (ox, oy)) * scale
+                                      ).astype(np.int32)], 255)
     return m
 
 
@@ -430,6 +431,9 @@ def _self_check() -> None:
     # region rasterization at half scale; ROIs pooled by name; exclusions apart
     m = rasterize([[[0, 0], [20, 0], [20, 20], [0, 20]]], (20, 20), 0, 0, 0.5)
     assert 90 <= (m > 0).sum() <= 121, (m > 0).sum()
+    m = rasterize([[[0, 0], [20, 0], [20, 20], [0, 20]], [[5, 5], [15, 5], [15, 15], [5, 15]]],
+                  (20, 20), 0, 0, 1)
+    assert m[10, 10] == 255                                    # overlapping: both, no hole
     regs = [{"name": "infarct", "points": [[0, 0], [1, 0], [1, 1]]},
             {"name": "exclude", "points": [[0, 0], [1, 0], [1, 1]]},
             {"name": "fold 1", "kind": "exclude", "points": [[0, 0], [1, 0], [1, 1]]},

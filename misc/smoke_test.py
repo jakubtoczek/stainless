@@ -1,7 +1,8 @@
 """The whole window, driven without a screen: add a scan, an ROI drawn with clicks, one traced
-freehand, nodes dragged, added and deleted, right-click cancelling; the control's role,
-artefacts found, aliases, measure, the live detail (and the outline in it), results and
-figure, export, options, save and reopen, undo. Points the options file at a scratch copy,
+freehand, nodes dragged, added and deleted, right-click cancelling, a trace crossing itself
+(no hole); the control's role, artefacts found, aliases, the sections window, measure, the
+live detail (and the outline in it), results and figure, export, options (alpha, lines, a
+minimized window opened again), save and reopen (an old crossing outline made whole), undo. Points the options file at a scratch copy,
 never the user's.
 
     .venv/Scripts/python misc/smoke_test.py [CZI] [--shots DIR]
@@ -29,9 +30,12 @@ def main(argv) -> int:
     from PySide6.QtGui import QMouseEvent
     from PySide6.QtWidgets import QApplication
 
+    import numpy as np
+    from PySide6.QtWidgets import QGraphicsPathItem
+
     from stainless import __main__ as entry
     from stainless import app as qapp
-    from stainless import analysis
+    from stainless import analysis, model
 
     assert "matplotlib" not in sys.modules, "the window module must not load matplotlib"
     args = [a for a in argv if not a.startswith("--")]
@@ -159,6 +163,32 @@ def main(argv) -> int:
     s0 = w.exp.sections[0]
     assert len(s0.regions) == 1
 
+    # a trace crossing itself: around a square, then on inside it across its own line —
+    # one outline around it all, no hole (even-odd filling made one)
+    def trace(pts):
+        dense = [pts[0]]
+        for (x0, y0), (x1, y1) in zip(pts, pts[1:]):
+            dense += [(x0 + (x1 - x0) * k / 12, y0 + (y1 - y0) * k / 12) for k in range(1, 13)]
+        ev(QEvent.MouseButtonPress, *dense[0])
+        for q in dense[1:]:
+            ev(QEvent.MouseMove, *q)
+        ev(QEvent.MouseButtonRelease, *dense[-1])
+
+    tab.draw.setChecked(True)
+    trace([(0.70, 0.30), (0.76, 0.30), (0.76, 0.36), (0.70, 0.36), (0.70, 0.30), (0.76, 0.33),
+           (0.72, 0.33), (0.72, 0.31), (0.74, 0.31), (0.74, 0.35)])
+    s0 = w.exp.sections[0]
+    lo = s0.regions[1]
+    pa = np.asarray(lo["points"], float)
+    area = 0.5 * abs(np.dot(pa[:, 0], np.roll(pa[:, 1], 1)) - np.dot(pa[:, 1], np.roll(pa[:, 0], 1)))
+    square = (0.06 * sc.w) * (0.06 * sc.h)
+    assert not model.crosses(pa) and 0.95 < area / square < 1.05, (area / square, len(pa))
+    assert lo["nodes"] == [] and len(lo["points"]) < 40, lo
+    shot("2a_crossing_trace")
+    w.do_undo()
+    s0 = w.exp.sections[0]
+    assert len(s0.regions) == 1
+
     # artefacts on the control
     tab.list.setCurrentRow(1)
     tab.find([w.exp.sections[1]])
@@ -171,11 +201,34 @@ def main(argv) -> int:
     shot("2b_artefacts")
     tab.list.setCurrentRow(0)
 
-    # aliases: shortened, remembered
+    # aliases: shortened; the experiment's own (none in the options)
     tab.shorten()
     assert [s.alias for s in w.exp.sections] == ["s0", "s1"], [s.alias for s in w.exp.sections]
-    assert w.opts["aliases"][w.exp.sections[0].name] == w.exp.sections[0].alias
+    assert "aliases" not in w.opts
     print("aliases:", [s.alias for s in w.exp.sections])
+
+    # the sections window: a row each, an alias edited there, a row clicked shows it
+    w.show_table()
+    tw = w.table_window
+    keys = tw.keys
+    assert tw.t.rowCount() == 2 and tw.t.isColumnHidden(keys.index("folder"))
+    assert not tw.t.isColumnHidden(keys.index("alias"))
+    row1 = next(r for r in range(2) if tw.t.item(r, 0).data(Qt.UserRole) == 1)
+    tw.t.item(row1, keys.index("alias")).setText("control")
+    wait(lambda: w.exp.sections[1].alias == "control", 5)
+    assert tw.t.rowCount() == 2
+    assert tab.list.item(1).text().startswith("control")
+    row1 = next(r for r in range(2) if tw.t.item(r, 0).data(Qt.UserRole) == 1)
+    tw.t.setCurrentCell(row1, keys.index("name"))
+    assert tab.list.currentRow() == 1
+    shot("2c_table", tw)
+    tw.showMinimized()
+    a.processEvents()
+    w.show_table()                                    # minimized: opened again
+    assert not tw.isMinimized() and tw.isVisible()
+    w.do_undo()
+    assert w.exp.sections[1].alias == "s1"
+    tab.list.setCurrentRow(0)
 
     # measure all, 4 × 4 averaged for speed
     tab.res_btns[2].click()
@@ -288,15 +341,28 @@ def main(argv) -> int:
     for i in range(ow.topics.count()):
         ow.topics.setCurrentRow(i)
         shot(f"7_options_{i}", ow)
-    ow._set(("colours", "tissue"), "#123456")
-    assert json.loads(qapp.OPTIONS.read_text(encoding="utf-8"))["colours"]["tissue"] == "#123456"
-    assert view.style["tissue"] == "#123456"
+    ow._set(("colours", "tissue"), "#80123456")       # with its alpha
+    assert json.loads(qapp.OPTIONS.read_text(encoding="utf-8"))["colours"]["tissue"] == "#80123456"
+    assert view.style["tissue"] == "#80123456"
+    ow._set(("lines", "roi", "width"), 5)
+    ow._set(("lines", "roi", "style"), "dot")
+    pen = [it for it in view.region_items if isinstance(it, QGraphicsPathItem)][0].pen()
+    assert pen.width() == 5 and pen.style() == Qt.DotLine, (pen.width(), pen.style())
+    shot("7b_lines")
+    ow.showMinimized()
+    a.processEvents()
+    w.show_options()                                  # minimized: opened again
+    assert not ow.isMinimized() and ow.isVisible()
     ow._set(("regions", "preset"), "MI")
     assert [tab.kind.itemText(i) for i in range(tab.kind.count())] == \
         ["ROI", "infarct", "border zone", "remote", "exclude"]
     ow.close()
 
-    # save, reopen
+    # save, reopen; a region from before, crossing itself, comes back whole
+    w.exp.sections[1].regions.append({"name": "old", "kind": "roi", "nodes": [], "points": [
+        [x * sc.w / 100, y * sc.h / 100] for x, y in
+        [(10, 10), (20, 10), (20, 20), (10, 20), (10, 10), (20, 15), (12, 15), (12, 11),
+         (16, 11), (16, 19)]]})
     w.exp.path = str(out / "exp.json")
     assert w.save()
     w2 = qapp.MainWindow()
@@ -307,6 +373,8 @@ def main(argv) -> int:
     assert e2.sections[0].maps and e2.record["title"] == "VCAM-1, MI-21"
     assert e2.sections[0].alias == w.exp.sections[0].alias
     assert any(r.get("auto") for r in e2.sections[1].regions)
+    assert not model.crosses(np.asarray(e2.sections[1].regions[-1]["points"], float))
+    assert "crossed their own outline" in w2.logbox.toPlainText()
     w2.dirty = False
     w.dirty = False
     print(f"smoke test OK ({out})")

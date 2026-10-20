@@ -25,7 +25,7 @@ from PySide6.QtWidgets import (QGraphicsItem, QGraphicsPathItem, QGraphicsPixmap
                                QGraphicsRectItem, QGraphicsScene, QGraphicsSimpleTextItem,
                                QGraphicsView, QLabel, QWidget)
 
-from . import analysis, czi, model
+from . import analysis, czi, model, options
 
 OVERVIEW_EDGE = 2400            # px: the overview's long side, at least
 DETAIL_MAX_PX = 8_000_000       # px read for the detail, at most
@@ -33,9 +33,13 @@ LIVE_FROM = 1.4                 # the detail is read past this zoom of the overv
 REGION_COLOURS = ["#ffb000", "#4aa3ff", "#c77dff", "#7ee081", "#ff7f50", "#00d1c1"]
 PAD = (30, 30, 30)              # the mosaic's padding, in the view's background colour
 NODE_PX, HIT_PX = 4, 7          # a node's half-size, and how near a click is a hit (screen px)
-STYLE = {"stained": (0, 230, 118), "tissue": "#8b0000", "excluded": "#ff4d4d",
-         "scalebar": "#ffffff", "white": 245, "badge": True, "bar_pos": "bottom right",
-         "bar_um": 0, "excl_as_tissue": False}
+_C = options.DEFAULTS["colours"]
+STYLE = {"stained": _C["stained_dab"], "tissue": _C["tissue"], "excluded": _C["excluded"],
+         "scalebar": _C["scalebar"], "white": 245, "badge": True, "bar_pos": "bottom right",
+         "bar_um": 0, "excl_as_tissue": False, "lines": options.DEFAULTS["lines"]}
+PEN = {"solid": Qt.SolidLine, "dash": Qt.DashLine, "dot": Qt.DotLine,
+       "dash-dot": Qt.DashDotLine}
+FULL = 235                      # the stained overlay's opacity at its densest, for alpha 255
 
 
 def level_for(edge_px: int, want: int) -> float:
@@ -286,13 +290,9 @@ class SlideView(QGraphicsView):
             self._put("base", display(self._ov["rgb"], self._lut()), scale=1 / self.ov_zoom)
 
     @staticmethod
-    def _rgb(colour) -> tuple:
-        c = QColor(colour) if isinstance(colour, str) else QColor(*colour)
-        return c.red(), c.green(), c.blue()
-
-    def _rgba(self, mask: np.ndarray, colour, alpha) -> np.ndarray:
+    def _rgba(mask: np.ndarray, colour: str) -> np.ndarray:
         out = np.zeros(mask.shape + (4,), np.uint8)
-        out[mask] = (*self._rgb(colour), alpha)
+        out[mask] = QColor(colour).getRgb()
         return out
 
     def _draw_nottissue(self):
@@ -303,7 +303,7 @@ class SlideView(QGraphicsView):
             self._put("nottissue", None)
             return
         out = ~ov["inside"] | (ov["s"] < self.settings.tissue_od)
-        self._put("nottissue", self._rgba(out & ov["scanned"], self.style["tissue"], 150),
+        self._put("nottissue", self._rgba(out & ov["scanned"], self.style["tissue"]),
                   scale=1 / self.ov_zoom, z=1)
 
     def _draw_map(self):
@@ -313,8 +313,9 @@ class SlideView(QGraphicsView):
             return
         rgba = np.zeros(st.shape + (4,), np.uint8)
         on = st > 0
-        rgba[on, :3] = self.style["stained"]
-        rgba[on, 3] = np.clip(110 + st[on].astype(np.int32) * 2, 0, 235)
+        *rgb, a = QColor(self.style["stained"]).getRgb()
+        rgba[on, :3] = rgb
+        rgba[on, 3] = np.clip(110 + st[on].astype(np.int32) * 2, 0, FULL) * a // 255
         self._put("map", rgba, scale=self.cell_px, z=1.5)
 
     def _redraw_detail(self):
@@ -333,9 +334,10 @@ class SlideView(QGraphicsView):
         rgba = np.zeros(s.shape + (4,), np.uint8)
         if self.layers["tissue"]:
             pad = (rgb.max(2) <= 5) | (rgb.min(2) >= 250)
-            rgba[(tis == 0) & ~pad] = (*self._rgb(self.style["tissue"]), 150)
+            rgba[(tis == 0) & ~pad] = QColor(self.style["tissue"]).getRgb()
         if self.layers["stained"]:
-            rgba[pos > 0] = (*self.style["stained"], 200)
+            *c, a = QColor(self.style["stained"]).getRgb()
+            rgba[pos > 0] = (*c, 200 * a // 255)
         self._put("detail_ov", rgba, x, y, 1 / z, z=3)
         n = cv2.countNonZero(tis)
         self.detail_changed.emit(
@@ -388,26 +390,31 @@ class SlideView(QGraphicsView):
     @staticmethod
     def _path(points, closed=True) -> QPainterPath:
         path = QPainterPath()
+        path.setFillRule(Qt.WindingFill)        # a loop dragged over the outline: no hole
         path.addPolygon(QPolygonF([QPointF(*p) for p in points]))
         if closed:
             path.closeSubpath()
         return path
 
+    def _pen(self, key: str, colour: QColor | None = None) -> QPen:
+        """A line as Options › Colours & lines has it."""
+        ln = self.style["lines"][key]
+        pen = QPen(QColor(colour or ln["colour"]), ln["width"])
+        pen.setStyle(PEN[ln["style"]])
+        pen.setCosmetic(True)
+        return pen
+
     def _region_item(self, r, i):
         c = self._colour(r)
         sel = i == self.selected
+        key = "selected" if sel else "excluded" if r["kind"] == "exclude" else "roi"
         item = QGraphicsPathItem(self._path(r["points"]))
-        pen = QPen(QColor("#ffffff") if sel else c, 3 if sel else 2)
-        pen.setCosmetic(True)
-        if r["kind"] == "exclude":
-            pen.setStyle(Qt.DashLine)
-        item.setPen(pen)
+        item.setPen(self._pen(key, None if sel else c))
         if r["kind"] == "exclude" and self.style["excl_as_tissue"]:
             fill = QColor(self.style["tissue"])
-            fill.setAlpha(150)
         else:
             fill = QColor(c)
-            fill.setAlpha(45 if sel else 22)
+            fill.setAlphaF(c.alphaF() * self.style["lines"][key]["fill"] / 100)
         item.setBrush(QBrush(fill))
         item.setZValue(5 + sel)
         return item
@@ -441,7 +448,7 @@ class SlideView(QGraphicsView):
         pen = QPen(QColor("#ffffff"), 1)
         pen.setCosmetic(True)
         h.setPen(pen)
-        h.setBrush(QBrush(QColor("#ffffff") if on else colour))
+        h.setBrush(QBrush(QColor("#ffffff") if on else QColor(colour.rgb())))   # opaque
         h.setZValue(9)
         return h
 
@@ -632,9 +639,7 @@ class SlideView(QGraphicsView):
     def _draw_trace(self, cursor=None):
         if self._trace is None:
             self._trace = QGraphicsPathItem()
-            pen = QPen(QColor("#ffffff"), 2)
-            pen.setCosmetic(True)
-            self._trace.setPen(pen)
+            self._trace.setPen(self._pen("trace"))
             self._trace.setZValue(10)
             self.scene().addItem(self._trace)
         self._trace.setPath(self._path(self._pts + ([cursor] if cursor else []), closed=False))

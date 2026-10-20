@@ -11,6 +11,9 @@ import re
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 
+import cv2
+import numpy as np
+
 from . import __version__, analysis, czi
 
 ROLES = ["sample", "negative control", "positive control", "left out"]
@@ -66,6 +69,47 @@ def normalized(r: dict) -> dict:
     if "nodes" not in r and len(r["points"]) > 40 and "auto" not in r:
         r["nodes"] = []          # ponytail: >40 points = a trace, the old files' only kind
     return r
+
+
+def crosses(a: np.ndarray) -> bool:
+    """Two edges of the closed outline *a* (n × 2) cross."""
+    b = np.roll(a, -1, axis=0)
+    n = len(a)
+    for i in range(n - 2):           # ponytail: O(n²), ~10 ms for a 1000-point trace
+        q = a[i + 2:n - (i == 0)]
+        s = b[i + 2:n - (i == 0)] - q
+        r = b[i] - a[i]
+        den = r[0] * s[:, 1] - r[1] * s[:, 0]
+        qp = q - a[i]
+        with np.errstate(divide="ignore", invalid="ignore"):
+            t = (qp[:, 0] * s[:, 1] - qp[:, 1] * s[:, 0]) / den
+            u = (qp[:, 0] * r[1] - qp[:, 1] * r[0]) / den
+        if ((den != 0) & (t > 0) & (t < 1) & (u > 0) & (u < 1)).any():
+            return True
+    return False
+
+
+def filled(r: dict) -> dict:
+    """The region as the outline around all it encloses: a trace crossing itself leaves no
+    hole and no lobe cancelling another (an outline that doesn't cross: as it is). Nodes go
+    to the nearest point of the new outline."""
+    a = np.asarray(r["points"], np.float64)
+    if len(a) < 4 or not crosses(a):
+        return r
+    lo = a.min(0)
+    k = 2000 / max(np.ptp(a, axis=0).max(), 1.0)                # raster px per scene px
+    m = np.zeros((int(np.ptp(a[:, 1]) * k) + 5, int(np.ptp(a[:, 0]) * k) + 5), np.uint8)
+    p = np.round((a - lo) * k + 2).astype(np.int32)
+    cv2.fillPoly(m, [p], 255)
+    cv2.polylines(m, [p], True, 255)
+    cs, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    c = cv2.approxPolyDP(max(cs, key=cv2.contourArea), 1.0, True)[:, 0]
+    pts = np.round((c - 2) / k + lo, 1)
+    out = {**r, "points": pts.tolist()}
+    if "nodes" in r:
+        out["nodes"] = sorted({int(((pts - a[j]) ** 2).sum(1).argmin()) for j in r["nodes"]
+                               if j < len(a)})
+    return out
 
 
 def is_node(r: dict, i: int) -> bool:
@@ -152,10 +196,9 @@ class Experiment:
     path: str = ""
 
     # -- sections
-    def add(self, paths, aliases: dict | None = None) -> tuple[list[Section], list[str]]:
-        """CZI files, or folders of them: their scenes as sections (with the alias a name
-        was given before, from *aliases*). Returns the new sections and what was left out,
-        with why."""
+    def add(self, paths) -> tuple[list[Section], list[str]]:
+        """CZI files, or folders of them: their scenes as sections. Returns the new
+        sections and what was left out, with why."""
         files, notes = [], []
         for p in map(Path, paths):
             if p.is_dir():
@@ -178,7 +221,7 @@ class Experiment:
             for sc in scs:
                 name = f.stem + (f" s{sc.index}" if len(scs) > 1 else "")
                 s = Section(str(f.resolve()), sc.index, name, role=guess_role(f.stem),
-                            alias=(aliases or {}).get(name, ""), scene=sc)
+                            scene=sc)
                 if s.key not in known:
                     known.add(s.key)
                     self.sections.append(s)
@@ -340,7 +383,16 @@ class Experiment:
         d = json.loads(Path(path).read_text(encoding="utf-8"))
         if "stainless" not in d:
             raise ValueError(f"{Path(path).name}: not a Stainless experiment")
-        return cls.from_dict(d, str(Path(path).resolve()))
+        e, problems = cls.from_dict(d, str(Path(path).resolve()))
+        n = 0
+        for s in e.sections:                  # drawn before outlines were made whole
+            new = [r if r.get("auto") else filled(r) for r in s.regions]
+            n += sum(a is not b for a, b in zip(new, s.regions))
+            s.regions = new
+        if n:
+            problems.append(f"{n} region(s) crossed their own outline (a hole where they did): "
+                            f"now the outline around them — measure again")
+        return e, problems
 
 
 def summary(rows: list[dict], region: str) -> list[dict]:
@@ -398,6 +450,20 @@ if __name__ == "__main__":
     assert delete_node(fh, j) and len(fh["nodes"]) == 3
     old = normalized({"name": "exclude", "points": [[i, i % 7] for i in range(60)]})
     assert old["kind"] == "exclude" and old["nodes"] == []
+    # a trace crossing itself: one outline around it, no hole; one that doesn't: as it is
+    sq = [[0, 0], [100, 0], [100, 100], [0, 100]]
+    eight = {"name": "e", "kind": "roi", "nodes": [0],
+             "points": [[0, 0], [100, 100], [100, 0], [0, 100]]}
+    f = filled(eight)
+    m = analysis.rasterize([f["points"]], (101, 101), 0, 0, 1)
+    assert m[50, 20] and m[50, 80] and not m[20, 50], "both lobes, nothing between"
+    assert len(f["nodes"]) == 1
+    wound = {"name": "w", "kind": "roi", "points": sq + [[0, 0], [100, 50], [20, 50], [20, 10],
+                                                         [60, 10], [60, 90]]}
+    assert crosses(np.asarray(wound["points"], float))
+    m = analysis.rasterize([filled(wound)["points"]], (101, 101), 0, 0, 1)
+    assert (m[1:-1, 1:-1] > 0).all(), "the square, whole"
+    assert filled(r) is r
     assert next_name([{"name": "ROI 1"}], "ROI") == "ROI 2"
     assert short_names(["2026_04_08__9672_SABG_Lv21 s0", "2026_04_08__9674_SABG_79 s1"]) == \
         ["9672 Lv21 s0", "9674 79 s1"]
