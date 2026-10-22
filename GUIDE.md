@@ -195,6 +195,12 @@ another computer, **Reset to defaults** puts everything back.
 An experiment's own settings (stain, rule, resolution, aliases) are saved with the experiment,
 not in the options.
 
+## Files
+
+- **Reads** Zeiss `.czi` brightfield scans (each scene a section).
+- **Writes** the experiment (`.json`: the sections with their paths relative to it, regions, the
+  record, settings, results), results as `.xlsx` / `.csv`, figures. The scans are never changed.
+
 ## Shortcuts
 
 | Keys | |

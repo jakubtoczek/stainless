@@ -55,12 +55,6 @@ Hover anything for what it does; the log at the bottom says what happened and wh
 wrong (✗ ⚠). The details, the shortcuts and the options are in the
 **[GUIDE.md](GUIDE.md)**, with how it measures.
 
-## Files
-
-- **Reads** Zeiss `.czi` brightfield scans (each scene a section).
-- **Writes** the experiment (`.json`: the sections with their paths relative to it, regions, the
-  record, settings, results), results as `.xlsx` / `.csv`, figures. The scans are never changed.
-
 ## Development
 
 ```bash
