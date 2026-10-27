@@ -10,7 +10,6 @@ experiment; here are only the ones a new experiment starts from.
 from __future__ import annotations
 
 import copy
-import json
 from pathlib import Path
 
 from PySide6.QtCore import Qt, Signal
@@ -20,6 +19,8 @@ from PySide6.QtWidgets import (QCheckBox, QColorDialog, QComboBox, QDoubleSpinBo
                                QListWidget, QMainWindow, QMessageBox, QPushButton,
                                QScrollArea, QSpinBox, QStackedWidget, QTableWidget,
                                QTableWidgetItem, QVBoxLayout, QWidget)
+
+from . import __version__, jsonfile
 
 FILE = Path(__file__).resolve().parents[2] / "stainless_options.json"   # beside Stainless.bat
 GREY = "color:#8d8d8d;"
@@ -80,7 +81,7 @@ def _merge(default, got, key=""):
 def load(path: Path | None = None, got=None) -> dict:
     if got is None:
         try:
-            got = json.loads((path or FILE).read_text(encoding="utf-8"))
+            got = jsonfile.read(path or FILE)        # its header: not an option, dropped
         except (OSError, ValueError):
             got = {}
     o = _merge(DEFAULTS, got if isinstance(got, dict) else {})
@@ -103,8 +104,7 @@ def load(path: Path | None = None, got=None) -> dict:
 
 def save(opts: dict, path: Path | None = None) -> bool:
     try:
-        (path or FILE).write_text(json.dumps(opts, indent=1, ensure_ascii=False),
-                                  encoding="utf-8")
+        jsonfile.write(path or FILE, opts, "stainless-options", 2, f"Stainless {__version__}")
         return True
     except OSError:
         return False

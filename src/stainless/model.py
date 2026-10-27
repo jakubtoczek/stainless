@@ -14,7 +14,9 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from . import __version__, analysis, czi
+from . import __version__, analysis, czi, jsonfile
+
+FORMAT, FORMAT_VERSION = "stainless-experiment", 2   # FORMATS.md; 1: "stainless": <version>
 
 ROLES = ["sample", "negative control", "positive control", "left out"]
 RECORD = ["title", "date", "operator", "project", "aim", "tissue", "target / antibody",
@@ -194,6 +196,7 @@ class Experiment:
     settings: analysis.Settings = field(default_factory=analysis.Settings)
     acquisition: dict = field(default_factory=dict)  # file name -> what the scan says
     path: str = ""
+    id: str = ""                                     # given at the first save, kept
 
     # -- sections
     def add(self, paths) -> tuple[list[Section], list[str]]:
@@ -329,15 +332,16 @@ class Experiment:
                 except ValueError:                        # another drive
                     d["rel"] = ""
             secs.append(d)
-        return {"stainless": __version__, "record": self.record,
+        return {"id": self.id, "record": self.record,
                 "settings": asdict(self.settings), "acquisition": self.acquisition,
                 "sections": secs}
 
     def save(self, path) -> None:
         import json
         self.path = str(Path(path).resolve())
-        Path(path).write_text(json.dumps(self.to_dict(), indent=1, ensure_ascii=False,
-                                         default=float), encoding="utf-8")
+        self.id = self.id or jsonfile.new_id()
+        d = json.loads(json.dumps(self.to_dict(), default=float))   # numpy's numbers too
+        jsonfile.write(path, d, FORMAT, FORMAT_VERSION, f"Stainless {__version__}", self.id)
 
     @classmethod
     def from_dict(cls, d: dict, path: str = "", known: dict | None = None
@@ -347,7 +351,8 @@ class Experiment:
         st = analysis.Settings.from_dict(d.get("settings", {}))
         rec = {k: "" for k in RECORD}
         rec.update({k: str(v) for k, v in d.get("record", {}).items()})
-        e = cls(record=rec, settings=st, acquisition=d.get("acquisition", {}), path=path)
+        e = cls(record=rec, settings=st, acquisition=d.get("acquisition", {}), path=path,
+                id=d.get("id", ""))
         base = Path(path).parent if path else None
         problems, scenes = [], {}
         for sd in d.get("sections", []):
@@ -379,10 +384,12 @@ class Experiment:
 
     @classmethod
     def open(cls, path) -> tuple["Experiment", list[str]]:
-        import json
-        d = json.loads(Path(path).read_text(encoding="utf-8"))
-        if "stainless" not in d:
-            raise ValueError(f"{Path(path).name}: not a Stainless experiment")
+        d = jsonfile.read(path)
+        try:
+            jsonfile.version_of(d, FORMAT, FORMAT_VERSION, lambda d: 1 if "stainless" in d else None)
+        except jsonfile.FormatError as ex:
+            raise ValueError(f"{Path(path).name}: "
+                             + (str(ex) if "newer" in str(ex) else "not a Stainless experiment"))
         e, problems = cls.from_dict(d, str(Path(path).resolve()))
         n = 0
         for s in e.sections:                  # drawn before outlines were made whole
@@ -430,7 +437,21 @@ if __name__ == "__main__":
     assert probs and e2.sections[0].regions == [dict(s.regions[0], kind="roi")]
     assert e2.sections[0].group == "MI"
     assert e2.sections[0].rule == {"threshold": 0.05}
-    assert json.loads(Path(d, "x.json").read_text(encoding="utf-8"))["stainless"] == __version__
+    saved = jsonfile.read(Path(d) / "x.json")       # the header first, the id kept by a save
+    assert (list(saved)[:3], saved["written_by"]) == (["format", "format_version", "id"],
+                                                    f"Stainless {__version__}"), list(saved)
+    e2.save(Path(d) / "x.json")
+    assert jsonfile.read(Path(d) / "x.json")["id"] == saved["id"]
+    Path(d, "v1.json").write_text(json.dumps({"stainless": "2026.10.20", "record": {"title": "t"}}),
+                                  encoding="utf-8")
+    assert Experiment.open(Path(d) / "v1.json")[0].record["title"] == "t", "version 1"
+    for bad, why in (({**saved, "format_version": 3}, "newer"), ({"x": 1}, "not a Stainless")):
+        Path(d, "bad.json").write_text(json.dumps(bad), encoding="utf-8")
+        try:
+            Experiment.open(Path(d) / "bad.json")
+            raise AssertionError(bad)
+        except ValueError as ex:
+            assert why in str(ex), ex
     e.export_csv(Path(d) / "r.csv")
     e.export_xlsx(Path(d) / "r.xlsx")
     sm = summary(e.rows() + [{**e.rows()[0], "pct": 7.0}], analysis.WHOLE)
