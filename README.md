@@ -55,6 +55,10 @@ Hover anything for what it does; the log at the bottom says what happened and wh
 wrong (✗ ⚠). The details, the shortcuts and the options are in the
 **[GUIDE.md](GUIDE.md)**, with how it measures.
 
+On Windows, an experiment (`.json`) also opens from Explorer: right-click › **Open with** ›
+Stainless — offered once Stainless has run, never made the default; `uninstall.bat` takes it off
+the list.
+
 ## Development
 
 ```bash

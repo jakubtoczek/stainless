@@ -2,7 +2,8 @@
 setlocal enabledelayedexpansion
 title Stainless uninstaller
 
-rem Stainless makes NO PATH or registry changes, so removing its runtime folder
+rem Stainless makes NO PATH change and one registry entry, Open with for .json (removed by
+rem :unshortcut below), so removing its runtime folder and that entry
 rem removes every trace it left. What "removing" means depends on where it went:
 rem   private root -> the whole folder is Stainless's, nothing else can be in it
 rem   shared root  -> the Python, uv.exe and package cache are shared with any
@@ -56,8 +57,9 @@ echo     %SHARED_ROOT%
 echo.
 echo   [1] Remove Stainless only  (recommended^)
 echo       Deletes %OWNENV%,
-echo       the Desktop shortcut and the Start menu entry. The shared Python,
-echo       uv.exe and package cache stay, so anything else using them keeps working.
+echo       the Desktop shortcut, the Start menu entry and the Open with entry.
+echo       The shared Python, uv.exe and package cache stay, so anything
+echo       else using them keeps working.
 echo.
 echo   [2] Remove EVERYTHING in %SHARED_ROOT%
 echo       Also deletes the shared Python, uv.exe and the package cache.
@@ -125,4 +127,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command ^
     "foreach ($d in 'Desktop', 'Programs') {" ^
         "$lnk = Join-Path ([Environment]::GetFolderPath($d)) 'Stainless.lnk';" ^
         "if (Test-Path $lnk) { Remove-Item $lnk -Force } }"
+rem the app's entry in Open with for .json (written by the app at each start)
+reg delete "HKCU\Software\Classes\.json\OpenWithProgids" /v Stainless.json /f >nul 2>&1
+reg delete "HKCU\Software\Classes\Stainless.json" /f >nul 2>&1
 exit /b 0

@@ -5,7 +5,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-from . import winshell
+from . import openwith, winshell
 
 _PKG = Path(__file__).resolve().parent  # this package's folder
 _crashes = None                         # stainless_errors.log, for faulthandler
@@ -85,6 +85,8 @@ def main() -> int:
 
     winshell.taskbar_identity("Stainless", "Stainless", _PKG.parents[1] / "Stainless.bat",
                               _PKG / "assets" / "stainless.ico")  # before any window
+    openwith.register("Stainless.json", "Stainless", "stainless", _PKG.parent,
+                      _PKG / "assets" / "stainless.ico")  # in Open with for .json
     app = QApplication(sys.argv)
     splash = _splash()
     app.processEvents()
